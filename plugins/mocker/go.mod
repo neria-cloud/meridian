@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	github.com/jaswdr/faker/v2 v2.8.0
-	github.com/neria-cloud/meridian/core v1.7.10
+	github.com/neria-cloud/meridian/core v1.7.13
 )
 
 require (
@@ -74,5 +74,3 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/neria-cloud/meridian/core => /Users/speckzzz/reps/agent01/neria/meridian-public-src/core
