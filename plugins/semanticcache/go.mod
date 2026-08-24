@@ -5,9 +5,9 @@ go 1.26.5
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/google/uuid v1.6.0
-	github.com/neria-cloud/meridian/core v1.7.10
+	github.com/neria-cloud/meridian/core v1.7.13
 	github.com/neria-cloud/meridian/framework v1.5.10
-	github.com/neria-cloud/meridian/plugins/mocker v1.5.19
+	github.com/neria-cloud/meridian/plugins/mocker v1.5.37
 )
 
 require (
@@ -125,7 +125,3 @@ require (
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/neria-cloud/meridian/core => /Users/speckzzz/reps/agent01/neria/meridian-public-src/core
-replace github.com/neria-cloud/meridian/framework => /Users/speckzzz/reps/agent01/neria/meridian-public-src/framework
-replace github.com/neria-cloud/meridian/plugins/mocker => /Users/speckzzz/reps/agent01/neria/meridian-public-src/plugins/mocker
