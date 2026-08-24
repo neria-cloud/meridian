@@ -22,9 +22,15 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # The secrets context cannot appear inside an `if:` expression (GitHub
+    # rejects it as "Unrecognized named-value: 'secrets'" at workflow-parse
+    # time, before any job runs). Route it through env: first — env context
+    # *is* permitted in `if:`.
+    env:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
     steps:
       - name: Require RELEASE_TOKEN
-        if: ${{ secrets.RELEASE_TOKEN == '' }}
+        if: ${{ env.RELEASE_TOKEN == '' }}
         run: |
           echo "::error::Repository secret RELEASE_TOKEN is not set. See RELEASING.md ('CI authentication') for how to create it." >&2
           exit 1
@@ -50,7 +56,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config url."https://x-access-token:${{ secrets.RELEASE_TOKEN }}@github.com/neria-cloud/".insteadOf "https://github.com/neria-cloud/"
+          git config url."https://x-access-token:${RELEASE_TOKEN}@github.com/neria-cloud/".insteadOf "https://github.com/neria-cloud/"
 
       - name: Release chain
         env:
