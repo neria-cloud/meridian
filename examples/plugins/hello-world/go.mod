@@ -2,7 +2,7 @@ module github.com/neria-cloud/meridian/examples/plugins/hello-world
 
 go 1.26.5
 
-require github.com/neria-cloud/meridian/core v1.7.10
+require github.com/neria-cloud/meridian/core v1.7.13
 
 require (
 	github.com/andybalholm/brotli v1.2.2 // indirect
