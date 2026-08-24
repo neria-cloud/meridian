@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	github.com/bytedance/sonic v1.15.1
-	github.com/neria-cloud/meridian/core v1.7.10
+	github.com/neria-cloud/meridian/core v1.7.13
 	github.com/neria-cloud/meridian/framework v1.5.10
 )
 
@@ -170,6 +170,3 @@ require (
 	gorm.io/driver/sqlite v1.6.0 // indirect
 	gorm.io/gorm v1.31.1 // indirect
 )
-
-replace github.com/neria-cloud/meridian/core => /Users/speckzzz/reps/agent01/neria/meridian-public-src/core
-replace github.com/neria-cloud/meridian/framework => /Users/speckzzz/reps/agent01/neria/meridian-public-src/framework
