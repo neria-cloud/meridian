@@ -2,7 +2,7 @@ module github.com/neria-cloud/meridian/plugins/jsonparser
 
 go 1.26.5
 
-require github.com/neria-cloud/meridian/core v1.7.10
+require github.com/neria-cloud/meridian/core v1.7.13
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
@@ -71,5 +71,3 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/neria-cloud/meridian/core => /Users/speckzzz/reps/agent01/neria/meridian-public-src/core
