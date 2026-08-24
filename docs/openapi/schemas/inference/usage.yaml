@@ -1,0 +1,89 @@
+# Usage and cost related schemas
+
+BifrostLLMUsage:
+  type: object
+  description: Token usage information
+  properties:
+    prompt_tokens:
+      type: integer
+      description: >
+        Total input tokens including any prompt-cache tokens (read + write).
+        Subtract prompt_tokens_details.cached_read_tokens and
+        prompt_tokens_details.cached_write_tokens to get the non-cached portion.
+    prompt_tokens_details:
+      $ref: '#/ChatPromptTokensDetails'
+    completion_tokens:
+      type: integer
+      description: Number of output/completion tokens generated.
+    completion_tokens_details:
+      $ref: '#/ChatCompletionTokensDetails'
+    total_tokens:
+      type: integer
+    cost:
+      $ref: '#/BifrostCost'
+
+ChatPromptTokensDetails:
+  type: object
+  properties:
+    text_tokens:
+      type: integer
+    audio_tokens:
+      type: integer
+    image_tokens:
+      type: integer
+    cached_read_tokens:
+      type: integer
+      description: >
+        Tokens served from the prompt cache (cache hit). These tokens are already
+        included in prompt_tokens and are billed at the reduced cache-read rate.
+        Populated for all providers that support prompt caching (Anthropic, Bedrock,
+        OpenAI, Gemini, xAI, etc.).
+    cached_write_tokens:
+      type: integer
+      description: >
+        Tokens written to the prompt cache on this request (cache creation / write).
+        These tokens are already included in prompt_tokens and are billed at the
+        cache-creation rate. Populated for providers that separately report cache
+        write tokens (Anthropic, Bedrock).
+
+ChatCompletionTokensDetails:
+  type: object
+  properties:
+    text_tokens:
+      type: integer
+    accepted_prediction_tokens:
+      type: integer
+    audio_tokens:
+      type: integer
+    citation_tokens:
+      type: integer
+    num_search_queries:
+      type: integer
+    reasoning_tokens:
+      type: integer
+    image_tokens:
+      type: integer
+    rejected_prediction_tokens:
+      type: integer
+
+BifrostCost:
+  type: object
+  description: Cost breakdown for the request
+  properties:
+    input_tokens_cost:
+      type: number
+    output_tokens_cost:
+      type: number
+    reasoning_tokens_cost:
+      type: number
+      description: Cost for reasoning/thinking tokens (reasoning models)
+    citation_tokens_cost:
+      type: number
+      description: Cost for citation tokens
+    search_queries_cost:
+      type: number
+      description: Cost for web search queries
+    request_cost:
+      type: number
+    total_cost:
+      type: number

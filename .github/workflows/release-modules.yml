@@ -1,0 +1,59 @@
+name: release-modules
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'core/version'
+      - 'framework/version'
+      - 'transports/version'
+      - 'cli/version'
+      - 'plugins/*/version'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read   # RELEASE_TOKEN (a PAT), not GITHUB_TOKEN, does the writing — see RELEASING.md
+
+# One release chain at a time; a second trigger waits instead of racing tags.
+concurrency:
+  group: release-modules
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require RELEASE_TOKEN
+        if: ${{ secrets.RELEASE_TOKEN == '' }}
+        run: |
+          echo "::error::Repository secret RELEASE_TOKEN is not set. See RELEASING.md ('CI authentication') for how to create it." >&2
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+          # Do not let actions/checkout embed a GITHUB_TOKEN auth header for
+          # this remote — it would take precedence over the insteadOf rewrite
+          # below and silently push with the (read-only) default token.
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: core/go.mod
+          cache: true
+
+      - name: Git identity and access to neria-cloud modules
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config url."https://x-access-token:${{ secrets.RELEASE_TOKEN }}@github.com/neria-cloud/".insteadOf "https://github.com/neria-cloud/"
+
+      - name: Release chain
+        env:
+          GOPRIVATE: github.com/neria-cloud/*
+          RELEASE_BRANCH: main
+        run: bash scripts/release-chain.sh

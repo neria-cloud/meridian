@@ -1,0 +1,9 @@
+{
+  "$schema": "https://meridian.neria.cloud/schema",
+  "config_store": {
+    "enabled": false
+  },
+  "logs_store": {
+    "enabled": false
+  }
+}

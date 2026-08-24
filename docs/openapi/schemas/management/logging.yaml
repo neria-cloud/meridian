@@ -1,0 +1,1384 @@
+# Logging API schemas
+
+LogEntry:
+  type: object
+  description: Log entry
+  properties:
+    id:
+      type: string
+    parent_request_id:
+      type: string
+    provider:
+      type: string
+    model:
+      type: string
+    status:
+      type: string
+      enum: ["processing", "success", "error"]
+    object:
+      type: string
+    timestamp:
+      type: string
+      format: date-time
+    number_of_retries:
+      type: integer
+    fallback_index:
+      type: integer
+    latency:
+      type: number
+    cost:
+      type: number
+    selected_key_id:
+      type: string
+    selected_key_name:
+      type: string
+    virtual_key_id:
+      type: string
+    virtual_key_name:
+      type: string
+      nullable: true
+    routing_engines_used:
+      type: array
+      items:
+        type: string
+      description: Array of routing engines used for this request (routing-rule, governance, or loadbalancing)
+      nullable: true
+    routing_rule_id:
+      type: string
+      nullable: true
+    routing_rule_name:
+      type: string
+      nullable: true
+    stream:
+      type: boolean
+    raw_request:
+      type: string
+    raw_response:
+      type: string
+    redaction_mapping:
+      type: object
+      properties:
+        input:
+          type: object
+          additionalProperties:
+            type: string
+        output:
+          type: object
+          additionalProperties:
+            type: string
+      description: Phase-scoped placeholder-to-original-value mappings for reversible redactions. Present only on log detail responses when the caller has `Logs:Reveal`.
+    created_at:
+      type: string
+      format: date-time
+    token_usage:
+      $ref: '../../schemas/inference/usage.yaml#/BifrostLLMUsage'
+    error_details:
+      $ref: '../../schemas/inference/common.yaml#/BifrostError'
+    input_history:
+      type: array
+      items:
+        $ref: '../../schemas/inference/chat.yaml#/ChatMessage'
+    responses_input_history:
+      type: array
+      items:
+        $ref: '../../schemas/inference/responses.yaml#/ResponsesMessage'
+    output_message:
+      $ref: '../../schemas/inference/chat.yaml#/ChatMessage'
+    responses_output:
+      type: array
+      items:
+        $ref: '../../schemas/inference/responses.yaml#/ResponsesMessage'
+    embedding_output:
+      type: array
+      items:
+        type: array
+        items:
+          type: number
+    params:
+      type: object
+      additionalProperties: true
+    tools:
+      type: array
+      items:
+        $ref: '../../schemas/inference/chat.yaml#/ChatTool'
+    tool_calls:
+      type: array
+      items:
+        $ref: '../../schemas/inference/chat.yaml#/ChatAssistantMessageToolCall'
+    speech_input:
+      type: object
+      additionalProperties: true
+    transcription_input:
+      type: object
+      additionalProperties: true
+    image_generation_input:
+      type: object
+      additionalProperties: true
+    speech_output:
+      type: object
+      additionalProperties: true
+    transcription_output:
+      type: object
+      additionalProperties: true
+    image_generation_output:
+      type: object
+      additionalProperties: true
+    cache_debug:
+      type: object
+      additionalProperties: true
+    metadata:
+      type: object
+      additionalProperties: true
+      description: Custom metadata captured from request headers (configured via logging_headers or x-bf-lh-* prefix)
+    selected_key:
+      type: object
+      additionalProperties: true
+    virtual_key:
+      type: object
+      additionalProperties: true
+    passthrough_request_body:
+      type: string
+      description: Raw passthrough request body (for passthrough integration routes)
+    passthrough_response_body:
+      type: string
+      description: Raw passthrough response body (for passthrough integration routes)
+    routing_engine_logs:
+      type: object
+      additionalProperties: true
+      description: Detailed logs from the routing engine decision process
+    is_large_payload_request:
+      type: boolean
+      description: Whether the request payload exceeded the large payload threshold
+    is_large_payload_response:
+      type: boolean
+      description: Whether the response payload exceeded the large payload threshold
+    rerank_output:
+      type: object
+      additionalProperties: true
+      description: Rerank operation output
+    video_generation_input:
+      type: object
+      additionalProperties: true
+      description: Video generation request input
+    video_generation_output:
+      type: object
+      additionalProperties: true
+      description: Video generation response output
+    video_retrieve_output:
+      type: object
+      additionalProperties: true
+      description: Video retrieve response output
+    video_list_output:
+      type: object
+      additionalProperties: true
+      description: Video list response output
+    video_delete_output:
+      type: object
+      additionalProperties: true
+      description: Video delete response output
+    video_download_output:
+      type: object
+      additionalProperties: true
+      description: Video download response output
+    list_models_output:
+      type: object
+      additionalProperties: true
+      description: List models response output
+
+MCPToolLogEntry:
+  type: object
+  description: MCP tool execution log entry
+  properties:
+    id:
+      type: string
+      description: Unique identifier for the log entry
+    llm_request_id:
+      type: string
+      description: Links to the LLM request that triggered this tool call
+    timestamp:
+      type: string
+      format: date-time
+      description: When the tool execution started
+    tool_name:
+      type: string
+      description: Name of the MCP tool that was executed
+    server_label:
+      type: string
+      description: Label of the MCP server that provided the tool
+    virtual_key_id:
+      type: string
+      description: ID of the virtual key used for this tool execution
+    virtual_key_name:
+      type: string
+      description: Name of the virtual key used for this tool execution
+    arguments:
+      type: object
+      additionalProperties: true
+      description: Tool execution arguments
+    result:
+      type: object
+      additionalProperties: true
+      description: Tool execution result
+    error_details:
+      $ref: '../../schemas/inference/common.yaml#/BifrostError'
+    latency:
+      type: number
+      description: Execution time in milliseconds
+    cost:
+      type: number
+      description: Cost in dollars for this tool execution
+    status:
+      type: string
+      enum: ["processing", "success", "error"]
+      description: Execution status
+    metadata:
+      type: object
+      additionalProperties: true
+      description: Custom metadata captured from request headers (configured via logging_headers or x-bf-lh-* prefix)
+    created_at:
+      type: string
+      format: date-time
+      description: When the log entry was created
+    virtual_key:
+      type: object
+      additionalProperties: true
+      description: Full virtual key object (populated when virtual_key_id is set)
+
+MCPToolLogSearchFilters:
+  type: object
+  description: MCP tool log search filters
+  properties:
+    tool_names:
+      type: array
+      items:
+        type: string
+      description: Filter by tool names
+    server_labels:
+      type: array
+      items:
+        type: string
+      description: Filter by server labels
+    status:
+      type: array
+      items:
+        type: string
+      description: Filter by execution status
+    llm_request_ids:
+      type: array
+      items:
+        type: string
+      description: Filter by linked LLM request IDs
+    start_time:
+      type: string
+      format: date-time
+      description: Filter by start time (RFC3339 format)
+    end_time:
+      type: string
+      format: date-time
+      description: Filter by end time (RFC3339 format)
+    min_latency:
+      type: number
+      description: Filter by minimum latency
+    max_latency:
+      type: number
+      description: Filter by maximum latency
+    content_search:
+      type: string
+      description: Search in tool arguments and results
+
+MCPToolLogStats:
+  type: object
+  description: MCP tool log statistics
+  properties:
+    total_executions:
+      type: integer
+      description: Total number of tool executions
+    success_rate:
+      type: number
+      description: Success rate percentage
+    average_latency:
+      type: number
+      description: Average execution latency in milliseconds
+    total_cost:
+      type: number
+      description: Total cost in dollars for all executions
+
+SearchMCPLogsResponse:
+  type: object
+  description: Search MCP logs response
+  properties:
+    logs:
+      type: array
+      items:
+        $ref: '#/MCPToolLogEntry'
+    pagination:
+      type: object
+      required:
+        - total_count
+      properties:
+        limit:
+          type: integer
+        offset:
+          type: integer
+        sort_by:
+          type: string
+        order:
+          type: string
+        total_count:
+          type: integer
+          format: int64
+          description: Total number of items matching the query
+    has_logs:
+      type: boolean
+      description: Whether any logs exist in the system
+
+MCPLogsFilterDataResponse:
+  type: object
+  description: Available MCP log filter data
+  properties:
+    tool_names:
+      type: array
+      items:
+        type: string
+      description: All unique tool names
+    server_labels:
+      type: array
+      items:
+        type: string
+      description: All unique server labels
+    virtual_keys:
+      type: array
+      items:
+        type: object
+        properties:
+          id:
+            type: string
+            description: Virtual key ID
+          name:
+            type: string
+            description: Virtual key name
+          value:
+            type: string
+            description: Virtual key value (redacted if applicable)
+      description: All unique virtual keys
+
+DeleteMCPLogsRequest:
+  type: object
+  description: Delete MCP logs request
+  required:
+    - ids
+  properties:
+    ids:
+      type: array
+      items:
+        type: string
+      description: Array of log IDs to delete
+
+SearchFilters:
+  type: object
+  description: Log search filters
+  properties:
+    providers:
+      type: array
+      items:
+        type: string
+    models:
+      type: array
+      items:
+        type: string
+    status:
+      type: array
+      items:
+        type: string
+    objects:
+      type: array
+      items:
+        type: string
+    selected_key_ids:
+      type: array
+      items:
+        type: string
+    virtual_key_ids:
+      type: array
+      items:
+        type: string
+    routing_rule_ids:
+      type: array
+      items:
+        type: string
+    routing_engine_used:
+      type: array
+      items:
+        type: string
+      description: Filter by routing engine (routing-rule, governance, or loadbalancing)
+    start_time:
+      type: string
+      format: date-time
+    end_time:
+      type: string
+      format: date-time
+    min_latency:
+      type: number
+    max_latency:
+      type: number
+    min_tokens:
+      type: integer
+    max_tokens:
+      type: integer
+    min_cost:
+      type: number
+    max_cost:
+      type: number
+    missing_cost_only:
+      type: boolean
+    content_search:
+      type: string
+
+SearchLogsResponse:
+  type: object
+  description: Search logs response
+  properties:
+    logs:
+      type: array
+      items:
+        $ref: '#/LogEntry'
+    pagination:
+      $ref: '#/PaginationOptions'
+    stats:
+      $ref: '#/LogStats'
+    has_logs:
+      type: boolean
+      description: Whether any logs exist in the system
+
+PaginationOptions:
+  type: object
+  description: Pagination metadata for list responses
+  properties:
+    limit:
+      type: integer
+    offset:
+      type: integer
+    sort_by:
+      type: string
+      enum: [timestamp, latency, tokens, cost]
+    order:
+      type: string
+      enum: [asc, desc]
+    total_count:
+      type: integer
+      format: int64
+      description: Total number of items matching the query
+
+LogStats:
+  type: object
+  description: Log statistics
+  required:
+    - total_requests
+    - total_tokens
+    - total_cost
+    - average_latency
+    - success_rate
+    - user_facing_success_rate
+    - user_facing_total_requests
+  properties:
+    total_requests:
+      type: integer
+      format: int64
+    total_tokens:
+      type: integer
+      format: int64
+    total_cost:
+      type: number
+    average_latency:
+      type: number
+    success_rate:
+      type: number
+      description: Percentage of completed provider attempts that succeeded
+    user_facing_success_rate:
+      type: number
+      description: Percentage of user requests that ultimately succeeded, counting fallback chains as one request
+    user_facing_total_requests:
+      type: integer
+      format: int64
+      description: Count of root requests used as the denominator for user_facing_success_rate
+    cache_hit_rate_total_requests:
+      type: integer
+      format: int64
+      description: Completed requests used as the local-cache hit-rate denominator
+    direct_cache_hits:
+      type: integer
+      format: int64
+      description: Number of direct local-cache hits
+    semantic_cache_hits:
+      type: integer
+      format: int64
+      description: Number of semantic local-cache hits
+
+DroppedRequestsResponse:
+  type: object
+  description: Dropped requests response
+  properties:
+    dropped_requests:
+      type: integer
+      format: int64
+
+FilterDataResponse:
+  type: object
+  description: Available filter data response
+  properties:
+    models:
+      type: array
+      items:
+        type: string
+    selected_keys:
+      type: array
+      items:
+        $ref: '../../schemas/management/providers.yaml#/Key'
+    virtual_keys:
+      type: array
+      items:
+        $ref: '../../schemas/management/governance.yaml#/VirtualKey'
+    routing_rules:
+      type: array
+      items:
+        $ref: '../../schemas/management/governance.yaml#/RoutingRule'
+      description: Available routing rules for filtering
+    routing_engines:
+      type: array
+      items:
+        type: string
+      description: Available routing engine types (routing-rule, governance, loadbalancing)
+
+DeleteLogsRequest:
+  type: object
+  description: Delete logs request
+  required:
+    - ids
+  properties:
+    ids:
+      type: array
+      items:
+        type: string
+
+RecalculateCostRequest:
+  type: object
+  description: Recalculate cost request
+  properties:
+    filters:
+      $ref: '#/SearchFilters'
+    limit:
+      type: integer
+      description: Maximum number of logs to process (default 200, max 1000)
+
+RecalculateCostResponse:
+  type: object
+  description: Recalculate cost job status
+  properties:
+    id:
+      type: string
+      description: Background job ID
+    status:
+      type: string
+      description: Current job status
+    total:
+      type: integer
+      format: int64
+      description: Total matching logs queued for recalculation
+    processed:
+      type: integer
+      format: int64
+      description: Logs processed so far
+    updated:
+      type: integer
+      format: int64
+      description: Logs updated with new costs
+    skipped:
+      type: integer
+      format: int64
+      description: Logs skipped during processing
+    message:
+      type: string
+      description: Optional progress message
+    last_error:
+      type: string
+      description: Last error encountered by the job
+    started_at:
+      type: string
+      format: date-time
+      description: Job start time
+    updated_at:
+      type: string
+      format: date-time
+      description: Last status update time
+
+# Histogram schemas
+
+HistogramBucket:
+  type: object
+  description: Time-bucketed request count
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    count:
+      type: integer
+      format: int64
+    success:
+      type: integer
+      format: int64
+    error:
+      type: integer
+      format: int64
+
+HistogramResult:
+  type: object
+  description: Time-bucketed request count histogram
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/HistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+
+TokenHistogramBucket:
+  type: object
+  description: Time-bucketed token usage
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    prompt_tokens:
+      type: integer
+      format: int64
+    completion_tokens:
+      type: integer
+      format: int64
+    total_tokens:
+      type: integer
+      format: int64
+
+TokenHistogramResult:
+  type: object
+  description: Time-bucketed token usage histogram
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/TokenHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+
+CostHistogramBucket:
+  type: object
+  description: Time-bucketed cost data with model breakdown
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    total_cost:
+      type: number
+    by_model:
+      type: object
+      additionalProperties:
+        type: number
+      description: Cost breakdown by model name
+
+CostHistogramResult:
+  type: object
+  description: Time-bucketed cost histogram with model breakdown
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/CostHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+    models:
+      type: array
+      items:
+        type: string
+      description: List of models present in the histogram
+
+ModelUsageStats:
+  type: object
+  description: Usage statistics for a single model
+  properties:
+    total:
+      type: integer
+      format: int64
+    success:
+      type: integer
+      format: int64
+    error:
+      type: integer
+      format: int64
+
+ModelHistogramBucket:
+  type: object
+  description: Time-bucketed model usage with success/error breakdown
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    by_model:
+      type: object
+      additionalProperties:
+        $ref: '#/ModelUsageStats'
+      description: Usage breakdown by model name
+
+ModelHistogramResult:
+  type: object
+  description: Time-bucketed model usage histogram
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/ModelHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+    models:
+      type: array
+      items:
+        type: string
+
+LatencyHistogramBucket:
+  type: object
+  description: Time-bucketed latency percentiles
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    avg_latency:
+      type: number
+    p90_latency:
+      type: number
+    p95_latency:
+      type: number
+    p99_latency:
+      type: number
+    total_requests:
+      type: integer
+      format: int64
+
+LatencyHistogramResult:
+  type: object
+  description: Time-bucketed latency histogram
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/LatencyHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+
+ProviderCostHistogramBucket:
+  type: object
+  description: Time-bucketed cost data with provider breakdown
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    total_cost:
+      type: number
+    by_provider:
+      type: object
+      additionalProperties:
+        type: number
+      description: Cost breakdown by provider name
+
+ProviderCostHistogramResult:
+  type: object
+  description: Time-bucketed cost histogram with provider breakdown
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/ProviderCostHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+    providers:
+      type: array
+      items:
+        type: string
+
+ProviderTokenStats:
+  type: object
+  description: Token statistics for a single provider
+  properties:
+    prompt_tokens:
+      type: integer
+      format: int64
+    completion_tokens:
+      type: integer
+      format: int64
+    total_tokens:
+      type: integer
+      format: int64
+
+ProviderTokenHistogramBucket:
+  type: object
+  description: Time-bucketed token usage with provider breakdown
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    by_provider:
+      type: object
+      additionalProperties:
+        $ref: '#/ProviderTokenStats'
+      description: Token usage breakdown by provider name
+
+ProviderTokenHistogramResult:
+  type: object
+  description: Time-bucketed token histogram with provider breakdown
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/ProviderTokenHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+    providers:
+      type: array
+      items:
+        type: string
+
+ProviderLatencyStats:
+  type: object
+  description: Latency statistics for a single provider
+  properties:
+    avg_latency:
+      type: number
+    p90_latency:
+      type: number
+    p95_latency:
+      type: number
+    p99_latency:
+      type: number
+    total_requests:
+      type: integer
+      format: int64
+
+ProviderLatencyHistogramBucket:
+  type: object
+  description: Time-bucketed latency data with provider breakdown
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    by_provider:
+      type: object
+      additionalProperties:
+        $ref: '#/ProviderLatencyStats'
+      description: Latency breakdown by provider name
+
+ProviderLatencyHistogramResult:
+  type: object
+  description: Time-bucketed latency histogram with provider breakdown
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/ProviderLatencyHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+    providers:
+      type: array
+      items:
+        type: string
+
+HistogramDimension:
+  type: string
+  description: |
+    Grouping dimension for dimension-aware histograms. Used by the
+    `/api/logs/histogram/{cost,tokens,latency}/by-dimension` endpoints.
+  enum:
+    - provider
+    - team_id
+    - customer_id
+    - user_id
+    - business_unit_id
+
+DimensionCostHistogramBucket:
+  type: object
+  description: Time-bucketed cost data grouped by an arbitrary dimension
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    total_cost:
+      type: number
+    by_dimension:
+      type: object
+      additionalProperties:
+        type: number
+      description: Cost breakdown keyed by the dimension value
+
+DimensionCostHistogramResult:
+  type: object
+  description: Dimension-grouped cost histogram result
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/DimensionCostHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+    dimension:
+      $ref: '#/HistogramDimension'
+    dimension_values:
+      type: array
+      items:
+        type: string
+
+DimensionTokenStats:
+  type: object
+  description: Token statistics for a single dimension value
+  properties:
+    prompt_tokens:
+      type: integer
+      format: int64
+    completion_tokens:
+      type: integer
+      format: int64
+    total_tokens:
+      type: integer
+      format: int64
+
+DimensionTokenHistogramBucket:
+  type: object
+  description: Time-bucketed token usage grouped by an arbitrary dimension
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    by_dimension:
+      type: object
+      additionalProperties:
+        $ref: '#/DimensionTokenStats'
+
+DimensionTokenHistogramResult:
+  type: object
+  description: Dimension-grouped token histogram result
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/DimensionTokenHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+    dimension:
+      $ref: '#/HistogramDimension'
+    dimension_values:
+      type: array
+      items:
+        type: string
+
+DimensionLatencyStats:
+  type: object
+  description: Latency statistics for a single dimension value
+  properties:
+    avg_latency:
+      type: number
+    p90_latency:
+      type: number
+    p95_latency:
+      type: number
+    p99_latency:
+      type: number
+    total_requests:
+      type: integer
+      format: int64
+
+DimensionLatencyHistogramBucket:
+  type: object
+  description: Time-bucketed latency data grouped by an arbitrary dimension
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    by_dimension:
+      type: object
+      additionalProperties:
+        $ref: '#/DimensionLatencyStats'
+
+DimensionLatencyHistogramResult:
+  type: object
+  description: Dimension-grouped latency histogram result
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/DimensionLatencyHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+    dimension:
+      $ref: '#/HistogramDimension'
+    dimension_values:
+      type: array
+      items:
+        type: string
+
+SessionDetailResult:
+  type: object
+  description: Paginated logs for a single parent-request session
+  properties:
+    session_id:
+      type: string
+    logs:
+      type: array
+      items:
+        $ref: '#/LogEntry'
+    pagination:
+      type: object
+      description: Pagination metadata. Session logs are always sorted by timestamp; the `sort_by` field is not configurable.
+      properties:
+        limit:
+          type: integer
+        offset:
+          type: integer
+        order:
+          type: string
+          enum: [asc, desc]
+        total_count:
+          type: integer
+          format: int64
+          description: Total number of items matching the query
+    count:
+      type: integer
+      format: int64
+      description: Total log count for this session
+    returned_count:
+      type: integer
+      description: Number of logs returned in this response
+    has_more:
+      type: boolean
+
+SessionSummaryResult:
+  type: object
+  description: Aggregate totals for a single parent-request session
+  properties:
+    session_id:
+      type: string
+    count:
+      type: integer
+      format: int64
+    total_cost:
+      type: number
+    total_tokens:
+      type: integer
+      format: int64
+    started_at:
+      type: string
+      description: Timestamp of the first log in the session (RFC3339 nanos)
+    latest_at:
+      type: string
+      description: Timestamp of the most recent log in the session (RFC3339 nanos)
+    duration_ms:
+      type: integer
+      format: int64
+
+ModelRankingEntry:
+  type: object
+  description: Aggregated stats for a single model over the query period
+  properties:
+    model:
+      type: string
+    provider:
+      type: string
+    total_requests:
+      type: integer
+      format: int64
+    success_count:
+      type: integer
+      format: int64
+    success_rate:
+      type: number
+    total_tokens:
+      type: integer
+      format: int64
+    total_cost:
+      type: number
+    avg_latency:
+      type: number
+
+ModelRankingTrend:
+  type: object
+  description: Percentage change versus the previous comparable period
+  properties:
+    has_previous_period:
+      type: boolean
+    requests_trend:
+      type: number
+    tokens_trend:
+      type: number
+    cost_trend:
+      type: number
+    latency_trend:
+      type: number
+
+ModelRankingWithTrend:
+  allOf:
+    - $ref: '#/ModelRankingEntry'
+    - type: object
+      properties:
+        trend:
+          $ref: '#/ModelRankingTrend'
+
+ModelRankingResult:
+  type: object
+  description: Models ranked by usage with trend comparison
+  properties:
+    rankings:
+      type: array
+      items:
+        $ref: '#/ModelRankingWithTrend'
+
+MCPHistogramBucket:
+  type: object
+  description: Time-bucketed MCP tool call volume
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    count:
+      type: integer
+      format: int64
+    success:
+      type: integer
+      format: int64
+    error:
+      type: integer
+      format: int64
+
+MCPHistogramResult:
+  type: object
+  description: Time-bucketed MCP tool call volume histogram
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/MCPHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+
+MCPCostHistogramBucket:
+  type: object
+  description: Time-bucketed MCP cost data
+  properties:
+    timestamp:
+      type: string
+      format: date-time
+    total_cost:
+      type: number
+
+MCPCostHistogramResult:
+  type: object
+  description: Time-bucketed MCP cost histogram
+  properties:
+    buckets:
+      type: array
+      items:
+        $ref: '#/MCPCostHistogramBucket'
+    bucket_size_seconds:
+      type: integer
+      format: int64
+
+MCPTopToolResult:
+  type: object
+  description: Aggregated stats for a single MCP tool
+  properties:
+    tool_name:
+      type: string
+    count:
+      type: integer
+      format: int64
+    cost:
+      type: number
+
+MCPTopToolsResult:
+  type: object
+  description: Top MCP tools by call count (limit 10)
+  properties:
+    tools:
+      type: array
+      items:
+        $ref: '#/MCPTopToolResult'
+
+RankingDimension:
+  type: string
+  description: Entity used to group dimension rankings
+  enum:
+    - team
+    - customer
+    - business_unit
+    - user
+    - virtual_key
+
+DimensionRankingEntry:
+  type: object
+  description: Aggregated usage for a single dimension value (team, user, virtual key, etc.)
+  properties:
+    id:
+      type: string
+    name:
+      type: string
+    total_requests:
+      type: integer
+      format: int64
+    total_tokens:
+      type: integer
+      format: int64
+    total_cost:
+      type: number
+
+DimensionRankingTrend:
+  type: object
+  description: Percentage change versus the previous comparable period
+  properties:
+    has_previous_period:
+      type: boolean
+    requests_trend:
+      type: number
+    tokens_trend:
+      type: number
+    cost_trend:
+      type: number
+
+DimensionRankingWithTrend:
+  allOf:
+    - $ref: '#/DimensionRankingEntry'
+    - type: object
+      properties:
+        trend:
+          $ref: '#/DimensionRankingTrend'
+
+DimensionRankingResult:
+  type: object
+  description: Dimension values ranked by usage with trend comparison
+  properties:
+    rankings:
+      type: array
+      items:
+        $ref: '#/DimensionRankingWithTrend'
+    dimension:
+      $ref: '#/RankingDimension'
+    total_actual_requests:
+      type: integer
+      format: int64
+      description: |
+        Distinct request count over the attributed population. Only set for
+        fan-out dimensions (team, customer, business_unit) on Postgres.
+    total_attributed_requests:
+      type: integer
+      format: int64
+      description: |
+        Requests credited to every dimension value they touch; the sum can
+        exceed the real request count. Only set for fan-out dimensions.
+
+DashboardMeta:
+  type: object
+  description: Parameters the dashboard data was computed with
+  properties:
+    generated_at:
+      type: string
+      format: date-time
+      description: UTC time the response was assembled
+    bucket_size_seconds:
+      type: integer
+      format: int64
+      description: Width of every histogram bucket, derived from the time range
+    start_time:
+      type: string
+      format: date-time
+      description: Resolved start of the queried range
+    end_time:
+      type: string
+      format: date-time
+      description: Resolved end of the queried range
+
+DashboardOverview:
+  type: object
+  description: Overview tab metrics
+  properties:
+    stats:
+      $ref: '#/LogStats'
+    requests:
+      $ref: '#/HistogramResult'
+    tokens:
+      $ref: '#/TokenHistogramResult'
+    cost:
+      $ref: '#/CostHistogramResult'
+    models:
+      $ref: '#/ModelHistogramResult'
+    latency:
+      $ref: '#/LatencyHistogramResult'
+
+DashboardProviderUsage:
+  type: object
+  description: Provider Usage tab metrics
+  properties:
+    cost:
+      $ref: '#/ProviderCostHistogramResult'
+    tokens:
+      $ref: '#/ProviderTokenHistogramResult'
+    latency:
+      $ref: '#/ProviderLatencyHistogramResult'
+
+DashboardModelRankings:
+  type: object
+  description: Model Rankings tab data
+  properties:
+    rankings:
+      $ref: '#/ModelRankingResult'
+    histogram:
+      $ref: '#/ModelHistogramResult'
+
+DashboardMCP:
+  type: object
+  description: MCP usage tab metrics
+  properties:
+    volume:
+      $ref: '#/MCPHistogramResult'
+    cost:
+      $ref: '#/MCPCostHistogramResult'
+    top_tools:
+      $ref: '#/MCPTopToolsResult'
+
+DashboardResult:
+  type: object
+  description: |
+    Consolidated payload containing every metric shown on the workspace
+    dashboard. Each section mirrors the response of its dedicated endpoint, so
+    consumers can integrate a single call instead of orchestrating many.
+  properties:
+    meta:
+      $ref: '#/DashboardMeta'
+    overview:
+      $ref: '#/DashboardOverview'
+    provider_usage:
+      $ref: '#/DashboardProviderUsage'
+    model_rankings:
+      $ref: '#/DashboardModelRankings'
+    dimension_rankings:
+      type: object
+      description: |
+        Ranking tables keyed by dimension (`team`, `user`, `virtual_key`,
+        `customer`, `business_unit`); each value is that dimension's rankings.
+      additionalProperties:
+        $ref: '#/DimensionRankingResult'
+    mcp:
+      $ref: '#/DashboardMCP'

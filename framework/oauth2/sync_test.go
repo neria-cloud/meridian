@@ -1,0 +1,522 @@
+package oauth2
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	meridian "github.com/neria-cloud/meridian/core"
+	"github.com/neria-cloud/meridian/core/schemas"
+	"github.com/neria-cloud/meridian/framework/configstore"
+	"github.com/neria-cloud/meridian/framework/configstore/tables"
+)
+
+// testConfigStore is a minimal in-memory implementation of configstore.ConfigStore
+// for use in oauth2 tests. Embeds the interface so unneeded methods panic if called.
+type testConfigStore struct {
+	configstore.ConfigStore
+
+	mu           sync.Mutex
+	oauthConfigs map[string]*tables.TableOauthConfig
+	oauthTokens  map[string]*tables.TableOauthToken
+	clientConfig *configstore.ClientConfig
+}
+
+func newTestConfigStore() *testConfigStore {
+	return &testConfigStore{
+		oauthConfigs: make(map[string]*tables.TableOauthConfig),
+		oauthTokens:  make(map[string]*tables.TableOauthToken),
+	}
+}
+
+func (s *testConfigStore) GetOauthConfigByID(_ context.Context, id string) (*tables.TableOauthConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg := s.oauthConfigs[id]
+	if cfg == nil {
+		return nil, nil
+	}
+	return meridian.Ptr(*cfg), nil
+}
+
+func (s *testConfigStore) GetOauthConfigByTokenID(_ context.Context, tokenID string) (*tables.TableOauthConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, cfg := range s.oauthConfigs {
+		if cfg.TokenID != nil && *cfg.TokenID == tokenID {
+			return meridian.Ptr(*cfg), nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *testConfigStore) UpdateOauthConfig(_ context.Context, cfg *tables.TableOauthConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.oauthConfigs[cfg.ID] = meridian.Ptr(*cfg)
+	return nil
+}
+
+func (s *testConfigStore) GetOauthTokenByID(_ context.Context, id string) (*tables.TableOauthToken, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	token := s.oauthTokens[id]
+	if token == nil {
+		return nil, nil
+	}
+	return meridian.Ptr(*token), nil
+}
+
+func (s *testConfigStore) UpdateOauthToken(_ context.Context, token *tables.TableOauthToken) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.oauthTokens[token.ID] = meridian.Ptr(*token)
+	return nil
+}
+
+func (s *testConfigStore) GetClientConfig(_ context.Context) (*configstore.ClientConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.clientConfig == nil {
+		return nil, nil
+	}
+	return meridian.Ptr(*s.clientConfig), nil
+}
+
+func (s *testConfigStore) GetExpiringOauthTokens(_ context.Context, before time.Time) ([]*tables.TableOauthToken, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var expiring []*tables.TableOauthToken
+	for _, token := range s.oauthTokens {
+		if token.ExpiresAt != nil && token.ExpiresAt.Before(before) {
+			expiring = append(expiring, meridian.Ptr(*token))
+		}
+	}
+	return expiring, nil
+}
+
+// seedFixtures inserts an authorized oauth_config + token pair into the store.
+// The token expires 1 minute from now so GetExpiringOauthTokens will find it.
+func seedFixtures(t *testing.T, store *testConfigStore, tokenURL string) (oauthConfigID string) {
+	t.Helper()
+
+	tokenID := "test-token-id"
+	store.oauthTokens[tokenID] = &tables.TableOauthToken{
+		ID:           tokenID,
+		AccessToken:  "old-access-token",
+		RefreshToken: "refresh-token",
+		TokenType:    "bearer",
+		ExpiresAt:    new(time.Now().Add(1 * time.Minute)),
+		Scopes:       "[]",
+	}
+
+	oauthConfigID = "test-oauth-config-id"
+	store.oauthConfigs[oauthConfigID] = &tables.TableOauthConfig{
+		ID:          oauthConfigID,
+		ClientID:    schemas.NewSecretVar("test-client-id"),
+		TokenURL:    tokenURL,
+		RedirectURI: "http://localhost/callback",
+		Scopes:      `["read"]`,
+		Status:      "authorized",
+		TokenID:     new(tokenID),
+		ExpiresAt:   time.Now().Add(24 * time.Hour),
+	}
+
+	return oauthConfigID
+}
+
+func newTestWorker(store *testConfigStore) *TokenRefreshWorker {
+	noopLogger := meridian.NewDefaultLogger(schemas.LogLevelError)
+	provider := NewOAuth2Provider(store, noopLogger)
+	provider.retryBaseDelay = 1 * time.Millisecond // speed up retry backoff in tests
+	return NewTokenRefreshWorker(provider, noopLogger)
+}
+
+func TestTestConfigStore_GetExpiringOauthTokens(t *testing.T) {
+	t.Run("ignores nil expiry tokens", func(t *testing.T) {
+		store := newTestConfigStore()
+		now := time.Now()
+		before := now.Add(5 * time.Minute)
+
+		store.oauthTokens["nil-expiry"] = &tables.TableOauthToken{
+			ID:           "nil-expiry",
+			AccessToken:  "access-token",
+			RefreshToken: "refresh-token",
+			TokenType:    "bearer",
+			ExpiresAt:    nil,
+			Scopes:       "[]",
+		}
+		store.oauthTokens["expiring"] = &tables.TableOauthToken{
+			ID:           "expiring",
+			AccessToken:  "access-token-2",
+			RefreshToken: "refresh-token-2",
+			TokenType:    "bearer",
+			ExpiresAt:    meridian.Ptr(now.Add(1 * time.Minute)),
+			Scopes:       "[]",
+		}
+
+		tokens, err := store.GetExpiringOauthTokens(context.Background(), before)
+		require.NoError(t, err)
+		require.Len(t, tokens, 1)
+		assert.Equal(t, "expiring", tokens[0].ID)
+	})
+}
+
+func TestMCPTempTokenAuthEnabled(t *testing.T) {
+	store := newTestConfigStore()
+	provider := NewOAuth2Provider(store, meridian.NewDefaultLogger(schemas.LogLevelError))
+
+	assert.False(t, provider.mcpTempTokenAuthEnabled(context.Background()))
+
+	store.clientConfig = &configstore.ClientConfig{}
+	assert.False(t, provider.mcpTempTokenAuthEnabled(context.Background()))
+
+	store.clientConfig.MCPEnableTempTokenAuth = true
+	assert.True(t, provider.mcpTempTokenAuthEnabled(context.Background()))
+}
+
+func TestBuildAuthorizeURLWithPKCE_IncludesResource(t *testing.T) {
+	provider := NewOAuth2Provider(newTestConfigStore(), meridian.NewDefaultLogger(schemas.LogLevelError))
+
+	authURL := provider.buildAuthorizeURLWithPKCE(
+		"https://auth.example.com/oauth/authorize?existing=1",
+		"client-id",
+		"https://bifrost.example.com/api/oauth/callback",
+		"state-token",
+		"challenge",
+		[]string{"mcp:read", "mcp:write"},
+		"https://mcp.cloudflare.com/mcp",
+	)
+
+	parsed, err := url.Parse(authURL)
+	require.NoError(t, err)
+	q := parsed.Query()
+	assert.Equal(t, "1", q.Get("existing"))
+	assert.Equal(t, "code", q.Get("response_type"))
+	assert.Equal(t, "client-id", q.Get("client_id"))
+	assert.Equal(t, "https://mcp.cloudflare.com/mcp", q.Get("resource"))
+	assert.Equal(t, "mcp:read mcp:write", q.Get("scope"))
+}
+
+func TestBuildAuthorizeURLWithPKCE_OmitsEmptyResource(t *testing.T) {
+	provider := NewOAuth2Provider(newTestConfigStore(), meridian.NewDefaultLogger(schemas.LogLevelError))
+
+	authURL := provider.buildAuthorizeURLWithPKCE(
+		"https://auth.example.com/oauth/authorize",
+		"client-id",
+		"https://bifrost.example.com/api/oauth/callback",
+		"state-token",
+		"challenge",
+		nil,
+		"",
+	)
+
+	parsed, err := url.Parse(authURL)
+	require.NoError(t, err)
+	_, exists := parsed.Query()["resource"]
+	assert.False(t, exists)
+}
+
+func TestExchangeCodeForTokensWithPKCE_IncludesResource(t *testing.T) {
+	var got url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		got = r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "access-token",
+			"token_type":   "bearer",
+		})
+	}))
+	defer server.Close()
+
+	provider := NewOAuth2Provider(newTestConfigStore(), meridian.NewDefaultLogger(schemas.LogLevelError))
+	_, err := provider.exchangeCodeForTokensWithPKCE(
+		context.Background(),
+		server.URL,
+		"auth-code",
+		"client-id",
+		"",
+		"https://bifrost.example.com/api/oauth/callback",
+		"verifier",
+		"https://mcp.cloudflare.com/mcp",
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, "authorization_code", got.Get("grant_type"))
+	assert.Equal(t, "https://mcp.cloudflare.com/mcp", got.Get("resource"))
+}
+
+func TestExchangeCodeForTokensWithPKCE_OmitsEmptyResource(t *testing.T) {
+	var got url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		got = r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "access-token",
+			"token_type":   "bearer",
+		})
+	}))
+	defer server.Close()
+
+	provider := NewOAuth2Provider(newTestConfigStore(), meridian.NewDefaultLogger(schemas.LogLevelError))
+	_, err := provider.exchangeCodeForTokensWithPKCE(
+		context.Background(),
+		server.URL,
+		"auth-code",
+		"client-id",
+		"",
+		"https://bifrost.example.com/api/oauth/callback",
+		"verifier",
+		"",
+	)
+
+	require.NoError(t, err)
+	_, exists := got["resource"]
+	assert.False(t, exists)
+}
+
+func TestExchangeRefreshToken_IncludesResource(t *testing.T) {
+	var got url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		got = r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "new-access-token",
+			"token_type":   "bearer",
+		})
+	}))
+	defer server.Close()
+
+	provider := NewOAuth2Provider(newTestConfigStore(), meridian.NewDefaultLogger(schemas.LogLevelError))
+	_, err := provider.exchangeRefreshToken(
+		context.Background(),
+		server.URL,
+		"client-id",
+		"",
+		"refresh-token",
+		"https://mcp.cloudflare.com/mcp",
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, "refresh_token", got.Get("grant_type"))
+	assert.Equal(t, "https://mcp.cloudflare.com/mcp", got.Get("resource"))
+}
+
+func TestExchangeRefreshToken_OmitsEmptyResource(t *testing.T) {
+	var got url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		got = r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "new-access-token",
+			"token_type":   "bearer",
+		})
+	}))
+	defer server.Close()
+
+	provider := NewOAuth2Provider(newTestConfigStore(), meridian.NewDefaultLogger(schemas.LogLevelError))
+	_, err := provider.exchangeRefreshToken(
+		context.Background(),
+		server.URL,
+		"client-id",
+		"",
+		"refresh-token",
+		"",
+	)
+
+	require.NoError(t, err)
+	_, exists := got["resource"]
+	assert.False(t, exists)
+}
+
+func TestTokenRefreshWorker_TransientError_DoesNotMarkExpired(t *testing.T) {
+	// A 503 response from the token server is a transient failure.
+	// The oauth_config must stay "authorized" so the connection can
+	// heal automatically when the server recovers.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	store := newTestConfigStore()
+	oauthConfigID := seedFixtures(t, store, server.URL+"/token")
+
+	worker := newTestWorker(store)
+	worker.refreshExpiredTokens(context.Background())
+
+	cfg, err := store.GetOauthConfigByID(context.Background(), oauthConfigID)
+	require.NoError(t, err)
+	assert.Equal(t, "authorized", cfg.Status, "transient server error must not mark config as expired")
+}
+
+func TestTokenRefreshWorker_PermanentError_MarksExpired(t *testing.T) {
+	// A 401 invalid_grant response is a permanent rejection from the auth server.
+	// The oauth_config must be marked "expired" to prompt the user to re-authorize.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":             "invalid_grant",
+			"error_description": "Refresh token expired or revoked",
+		})
+	}))
+	defer server.Close()
+
+	store := newTestConfigStore()
+	oauthConfigID := seedFixtures(t, store, server.URL+"/token")
+
+	worker := newTestWorker(store)
+	worker.refreshExpiredTokens(context.Background())
+
+	cfg, err := store.GetOauthConfigByID(context.Background(), oauthConfigID)
+	require.NoError(t, err)
+	assert.Equal(t, "expired", cfg.Status, "permanent auth rejection must mark config as expired")
+}
+
+func TestTokenRefreshWorker_SuccessfulRefresh_UpdatesToken(t *testing.T) {
+	// A successful refresh must update the stored access token and
+	// leave the oauth_config status as "authorized".
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "new-access-token",
+			"refresh_token": "new-refresh-token",
+			"token_type":    "bearer",
+			"expires_in":    3600,
+		})
+	}))
+	defer server.Close()
+
+	store := newTestConfigStore()
+	oauthConfigID := seedFixtures(t, store, server.URL+"/token")
+
+	worker := newTestWorker(store)
+	worker.refreshExpiredTokens(context.Background())
+
+	cfg, err := store.GetOauthConfigByID(context.Background(), oauthConfigID)
+	require.NoError(t, err)
+	assert.Equal(t, "authorized", cfg.Status)
+
+	token, err := store.GetOauthTokenByID(context.Background(), *cfg.TokenID)
+	require.NoError(t, err)
+	assert.Equal(t, "new-access-token", token.AccessToken)
+}
+
+func TestTokenRefreshWorker_ConnectionRefused_DoesNotMarkExpired(t *testing.T) {
+	// This is the exact failure mode that triggered this fix: the machine goes
+	// offline, DNS fails, and the token endpoint is unreachable. The transport
+	// error (client.Do fails) must not mark the config expired.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	tokenURL := server.URL + "/token"
+	server.Close() // close immediately so all connection attempts are refused
+
+	store := newTestConfigStore()
+	oauthConfigID := seedFixtures(t, store, tokenURL)
+
+	worker := newTestWorker(store)
+	worker.refreshExpiredTokens(context.Background())
+
+	cfg, err := store.GetOauthConfigByID(context.Background(), oauthConfigID)
+	require.NoError(t, err)
+	assert.Equal(t, "authorized", cfg.Status, "connection refused must not mark config as expired")
+}
+
+func TestTokenRefreshWorker_400InvalidGrant_MarksExpired(t *testing.T) {
+	// 400 invalid_grant is the canonical RFC 6749 signal that a refresh token
+	// has been revoked. Must mark the config expired.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":             "invalid_grant",
+			"error_description": "The refresh token has been revoked",
+		})
+	}))
+	defer server.Close()
+
+	store := newTestConfigStore()
+	oauthConfigID := seedFixtures(t, store, server.URL+"/token")
+
+	worker := newTestWorker(store)
+	worker.refreshExpiredTokens(context.Background())
+
+	cfg, err := store.GetOauthConfigByID(context.Background(), oauthConfigID)
+	require.NoError(t, err)
+	assert.Equal(t, "expired", cfg.Status, "400 invalid_grant must mark config as expired")
+}
+
+func TestTokenRefreshWorker_429RateLimit_DoesNotMarkExpired(t *testing.T) {
+	// 429 Too Many Requests is a transient rate limit — not a permanent auth
+	// rejection. Must not mark the config expired.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	store := newTestConfigStore()
+	oauthConfigID := seedFixtures(t, store, server.URL+"/token")
+
+	worker := newTestWorker(store)
+	worker.refreshExpiredTokens(context.Background())
+
+	cfg, err := store.GetOauthConfigByID(context.Background(), oauthConfigID)
+	require.NoError(t, err)
+	assert.Equal(t, "authorized", cfg.Status, "429 rate limit must not mark config as expired")
+}
+
+func TestTokenRefreshWorker_400InvalidRequest_DoesNotMarkExpired(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":             "invalid_request",
+			"error_description": "Missing required parameter",
+		})
+	}))
+	defer server.Close()
+
+	store := newTestConfigStore()
+	oauthConfigID := seedFixtures(t, store, server.URL+"/token")
+
+	worker := newTestWorker(store)
+	worker.refreshExpiredTokens(context.Background())
+
+	cfg, err := store.GetOauthConfigByID(context.Background(), oauthConfigID)
+	require.NoError(t, err)
+	assert.Equal(t, "authorized", cfg.Status, "400 invalid_request must not mark config as expired")
+}
+
+func TestTokenRefreshWorker_400UnauthorizedClient_MarksExpired(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":             "unauthorized_client",
+			"error_description": "Client is not authorized for this grant type",
+		})
+	}))
+	defer server.Close()
+
+	store := newTestConfigStore()
+	oauthConfigID := seedFixtures(t, store, server.URL+"/token")
+
+	worker := newTestWorker(store)
+	worker.refreshExpiredTokens(context.Background())
+
+	cfg, err := store.GetOauthConfigByID(context.Background(), oauthConfigID)
+	require.NoError(t, err)
+	assert.Equal(t, "expired", cfg.Status, "400 unauthorized_client must mark config as expired")
+}

@@ -1,0 +1,58 @@
+clear-by-cache-id:
+  delete:
+    operationId: clearCacheByCacheId
+    summary: Clear cache entry by cache ID
+    description: |
+      Deletes a single cache entry by its storage ID. Read the cache ID from
+      `extra_fields.cache_debug.cache_id` on a prior response — it is populated
+      on both cache hits and cache misses.
+    tags:
+      - Cache
+    parameters:
+      - name: cacheId
+        in: path
+        required: true
+        description: Storage ID of the cache entry to delete
+        schema:
+          type: string
+    security:
+      - ManagementBearerAuth: []
+    responses:
+      '200':
+        description: Cache cleared successfully
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/management/cache.yaml#/ClearCacheResponse'
+      '400':
+        $ref: '../../openapi.yaml#/components/responses/BadRequest'
+      '500':
+        $ref: '../../openapi.yaml#/components/responses/InternalError'
+
+clear-by-cache-key:
+  delete:
+    operationId: clearCacheByCacheKey
+    summary: Clear cache by cache key
+    description: Clears a cache entry by its direct cache key.
+    tags:
+      - Cache
+    parameters:
+      - name: cacheKey
+        in: path
+        required: true
+        description: Cache key to clear
+        schema:
+          type: string
+    security:
+      - ManagementBearerAuth: []
+    responses:
+      '200':
+        description: Cache cleared successfully
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/management/cache.yaml#/ClearCacheResponse'
+      '400':
+        $ref: '../../openapi.yaml#/components/responses/BadRequest'
+      '500':
+        $ref: '../../openapi.yaml#/components/responses/InternalError'

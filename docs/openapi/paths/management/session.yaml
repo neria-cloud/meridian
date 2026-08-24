@@ -1,0 +1,122 @@
+login:
+  post:
+    operationId: login
+    summary: Login
+    description: |
+      Authenticates a user and returns a session token.
+      Sets a cookie with the session token for subsequent requests.
+    tags:
+      - Session
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '../../schemas/management/session.yaml#/LoginRequest'
+    # Public: exchanges username/password for a session token. Whitelisted
+    # server-side (systemWhitelistedRoutes), so no bearer token is required.
+    security: []
+    responses:
+      '200':
+        description: Login successful
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/management/session.yaml#/LoginResponse'
+      '400':
+        $ref: '../../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: Invalid credentials
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+      '403':
+        description: Authentication is not enabled
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+      '500':
+        $ref: '../../openapi.yaml#/components/responses/InternalError'
+
+logout:
+  post:
+    operationId: logout
+    summary: Logout
+    description: Logs out the current user and invalidates the session token.
+    tags:
+      - Session
+    # Authenticated like every management endpoint (management API key), and the
+    # dashboard additionally calls it with its HTTPOnly session cookie.
+    security:
+      - ManagementBearerAuth: []
+      - SessionCookieAuth: []
+    responses:
+      '200':
+        description: Logout successful
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/management/session.yaml#/LogoutResponse'
+      '403':
+        description: Authentication is not enabled
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+
+is-auth-enabled:
+  get:
+    operationId: isAuthEnabled
+    summary: Check if authentication is enabled
+    description: Returns whether authentication is enabled and if the current token is valid.
+    tags:
+      - Session
+    # Public: callable before login so the UI can decide whether to prompt for
+    # credentials. Whitelisted server-side (systemWhitelistedRoutes).
+    security: []
+    responses:
+      '200':
+        description: Successful response
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/management/session.yaml#/IsAuthEnabledResponse'
+      '500':
+        $ref: '../../openapi.yaml#/components/responses/InternalError'
+
+ws-ticket:
+  post:
+    operationId: issueWSTicket
+    summary: Issue WebSocket ticket
+    description: |
+      Issues a short-lived ticket for authenticating WebSocket connections.
+      The ticket can be used as a query parameter when upgrading to WebSocket.
+    tags:
+      - Session
+    # Authenticated like every management endpoint (management API key), and the
+    # dashboard additionally calls it with its HTTPOnly session cookie before
+    # opening a WebSocket connection.
+    security:
+      - ManagementBearerAuth: []
+      - SessionCookieAuth: []
+    responses:
+      '200':
+        description: Ticket issued successfully
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ticket:
+                  type: string
+                  description: Short-lived WebSocket authentication ticket
+      '403':
+        description: Authentication is not enabled
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+      '500':
+        $ref: '../../openapi.yaml#/components/responses/InternalError'
