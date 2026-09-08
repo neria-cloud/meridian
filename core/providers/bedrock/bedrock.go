@@ -2167,19 +2167,15 @@ func (provider *BedrockProvider) Rerank(ctx *schemas.BifrostContext, key schemas
 		return nil, err
 	}
 
-	// Bedrock's Rerank API addresses its model by ARN, unlike every other Bedrock
-	// operation. Synthesize one from the resolved region when the caller passed a
-	// bare model ID so rerank accepts the same identifiers the other routes do.
-	modelARN := resolveBedrockRerankModelARN(ctx, key, request.Model)
-	if modelARN == "" {
-		return nil, providerUtils.NewConfigurationError("bedrock rerank requires a model identifier")
+	if !strings.HasPrefix(request.Model, "arn:") {
+		return nil, providerUtils.NewConfigurationError(fmt.Sprintf("bedrock rerank requires an ARN model identifier; got %q", request.Model))
 	}
 
 	jsonData, bifrostErr := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
 		func() (providerUtils.RequestBodyWithExtraParams, error) {
-			return ToBedrockRerankRequest(request, modelARN)
+			return ToBedrockRerankRequest(request, request.Model)
 		},
 	)
 	if bifrostErr != nil {

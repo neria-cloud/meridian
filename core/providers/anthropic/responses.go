@@ -299,23 +299,6 @@ func reasoningPayloadAndSummary(item *schemas.ResponsesMessage) (string, bool) {
 	return encrypted, len(item.ResponsesReasoning.Summary) > 0
 }
 
-// isReasoningItem reports whether a stream item must be converted as reasoning.
-// The declared type alone is not enough: providers mislabel reasoning as a function
-// call when thinking is enabled, so an item typed as a function call that carries a
-// ResponsesReasoning payload is reasoning too. The block-type decision at
-// output_item.added and the encrypted-payload split at output_item.done both consult
-// this, because disagreeing is what left the misclassified path opening
-// redacted_thinking for summary-bearing items after the reasoning path was fixed.
-func isReasoningItem(item *schemas.ResponsesMessage) bool {
-	if item == nil || item.Type == nil {
-		return false
-	}
-	if *item.Type == schemas.ResponsesMessageTypeReasoning {
-		return true
-	}
-	return *item.Type == schemas.ResponsesMessageTypeFunctionCall && item.ResponsesReasoning != nil
-}
-
 // blockAcceptsDeltaType reports whether an Anthropic content block of blockType may
 // receive a delta of deltaType. It mirrors the validation Anthropic clients apply
 // while assembling a stream; a mismatch is not a cosmetic wire defect but a hard
@@ -2981,33 +2964,23 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 						// Check if this item actually has reasoning content (misclassified)
 						// When thinking is enabled, reasoning content might be incorrectly classified as FunctionCall
 						if bifrostResp.Item.ResponsesReasoning != nil {
-							// This is actually reasoning content, not a function call, so it
-							// follows the same rule as the reasoning branch above: open
-							// redacted_thinking only when the encrypted payload is all the item
-							// has. Judging on "has encrypted content" alone downgraded a
-							// summary-bearing item to an atomic block, and the signature_delta
-							// that follows is the frame the client throws
-							// "Content block is not a thinking block" on. The encrypted half is
-							// not dropped -- output_item.done splits it into its own
-							// redacted_thinking block, which is why isReasoningItem has to route
-							// this shape there as well.
+							// This is actually reasoning content, not a function call
 							embedID := providerUtils.ShouldEmbedReasoningItemID(ctx, bifrostResp.ExtraFields.Provider, bifrostResp.ExtraFields.RoutingInfo.Model)
-							encrypted, hasSummary := reasoningPayloadAndSummary(bifrostResp.Item)
-							if encrypted != "" && !hasSummary {
+							contentBlock.Type = AnthropicContentBlockTypeThinking
+							contentBlock.Thinking = schemas.Ptr("")
+							signature := ""
+							if embedID {
+								signature = providerUtils.EmbedReasoningItemID(bifrostResp.Item.ID, "")
+							}
+							contentBlock.Signature = &signature
+							// Check if there's encrypted content for redacted_thinking
+							if bifrostResp.Item.ResponsesReasoning.EncryptedContent != nil && *bifrostResp.Item.ResponsesReasoning.EncryptedContent != "" {
 								contentBlock.Type = AnthropicContentBlockTypeRedactedThinking
-								data := encrypted
+								data := *bifrostResp.Item.ResponsesReasoning.EncryptedContent
 								if embedID {
 									data = providerUtils.EmbedReasoningItemID(bifrostResp.Item.ID, data)
 								}
 								contentBlock.Data = &data
-							} else {
-								contentBlock.Type = AnthropicContentBlockTypeThinking
-								contentBlock.Thinking = schemas.Ptr("")
-								signature := ""
-								if embedID {
-									signature = providerUtils.EmbedReasoningItemID(bifrostResp.Item.ID, "")
-								}
-								contentBlock.Signature = &signature
 							}
 						} else {
 							// A real function call. It always opens as tool_use: the
@@ -3446,7 +3419,9 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 			})
 
 			return events
-		} else if isReasoningItem(bifrostResp.Item) {
+		} else if bifrostResp.Item != nil &&
+			bifrostResp.Item.Type != nil &&
+			*bifrostResp.Item.Type == schemas.ResponsesMessageTypeReasoning {
 
 			// Reasoning complete. Close the block opened at output_item.added, then --
 			// when that block was a thinking block and the finished item carries an
