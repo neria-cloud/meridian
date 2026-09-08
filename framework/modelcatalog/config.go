@@ -101,7 +101,7 @@ const (
 	DefaultPricingTimeout         = datasheet.DefaultPricingTimeout
 	DefaultModelParametersTimeout = datasheet.DefaultModelParametersTimeout
 
-	DefaultMCPLibraryURL     = "https://getbifrost.ai/mcp-library"
+	DefaultMCPLibraryURL     = "https://meridian.neria.cloud/mcp-library"
 	DefaultMCPLibraryTimeout = 45 * time.Second
 )
 

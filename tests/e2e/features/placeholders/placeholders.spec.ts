@@ -13,7 +13,7 @@ test.describe('Placeholder and Enterprise Pages', () => {
     const readMore = page.getByTestId('alert-rules-read-more')
     await expect(readMore).toBeVisible()
     const [popup] = await Promise.all([page.waitForEvent('popup'), readMore.click()])
-    await expect(popup).toHaveURL(/^https:\/\/docs\.getbifrost\.ai\/enterprise\/alerting\/alert-rules(\?|$)/)
+    await expect(popup).toHaveURL(/^https:\/\/meridian\.neria\.cloud\/enterprise\/alerting\/alert-rules(\?|$)/)
     await popup.close()
   })
 
@@ -60,7 +60,7 @@ test.describe('Placeholder and Enterprise Pages', () => {
     const readMore = page.getByRole('button', { name: /Read more/i })
     await expect(readMore).toBeVisible()
     const [popup] = await Promise.all([page.waitForEvent('popup'), readMore.click()])
-    await expect(popup).toHaveURL(/^https:\/\/docs\.getbifrost\.ai\/enterprise\/adaptive-load-balancing(\?|$)/)
+    await expect(popup).toHaveURL(/^https:\/\/meridian\.neria\.cloud\/enterprise\/adaptive-load-balancing(\?|$)/)
     await popup.close()
   })
 
