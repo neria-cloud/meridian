@@ -15,7 +15,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/klauspost/compress v1.18.6
 	github.com/mark3labs/mcp-go v0.43.2
-	github.com/neria-cloud/meridian/core v1.7.13
+	github.com/neria-cloud/meridian/core v1.7.10
 	github.com/neria-cloud/meridian/framework v1.5.10
 	github.com/neria-cloud/meridian/plugins/compat v0.1.36
 	github.com/neria-cloud/meridian/plugins/governance v1.6.14
@@ -152,9 +152,9 @@ require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-sqlite3 v1.14.32 // indirect
+	github.com/neria-cloud/meridian/plugins/mocker v1.5.37 // indirect
 	github.com/maximhq/maxim-go v0.2.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/neria-cloud/meridian/plugins/mocker v1.5.37 // indirect
 	github.com/oapi-codegen/runtime v1.1.1 // indirect
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/onsi/gomega v1.38.2 // indirect

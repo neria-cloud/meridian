@@ -3,9 +3,9 @@ module github.com/neria-cloud/meridian/plugins/maxim
 go 1.26.5
 
 require (
-	github.com/maximhq/maxim-go v0.2.1
-	github.com/neria-cloud/meridian/core v1.7.13
+	github.com/neria-cloud/meridian/core v1.7.10
 	github.com/neria-cloud/meridian/framework v1.5.10
+	github.com/maximhq/maxim-go v0.2.1
 )
 
 require (
