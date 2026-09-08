@@ -1,73 +1,59 @@
 # Releasing Meridian modules
 
-This repository is the rebranded fork of Bifrost, published as Go modules under `github.com/neria-cloud/meridian/*`. This document describes the release machinery in `scripts/` and `.github/workflows/release-modules.yml`: how a change to a module's `version` file turns into a pushed, immutable, pinned Go module release.
+Releases are produced by `bifrost-prep release` from an upstream checkout. Nothing in this
+repository runs the release; the former `scripts/` and the `release-modules` workflow were
+retired on 2026-09-09 because they re-pinned every module to the base's version files, which
+is not what upstream ships.
 
-## Model
+## Prerequisites
 
-- **Version files are the source of truth**, exactly as upstream: `core/version`, `framework/version`, `transports/version`, `plugins/<name>/version`, `cli/version` hold bare semvers (`1.7.13`).
-- **Tags are path-prefixed** as Go requires for subdirectory modules: `core/v1.7.13`, `framework/v1.5.10`, `plugins/governance/v1.6.14`, `transports/v1.6.11`, `cli/v0.10.6`. A consumer writes `require github.com/neria-cloud/meridian/core v1.7.13` — the prefix lives only in the tag.
-- **Versions mirror upstream's** for pristine syncs; the different module path prevents any collision, and the 1:1 mapping is self-documenting. Name the upstream base (`ent-vX.Y.Z-base`) in the sync commit message.
-- **Release order** is dependency order: `core → framework → plugins/* → transports → cli`, auto-discovered from the `version` files (`scripts/release-lib.sh: ordered_modules`). A module is tagged only after everything it requires is tagged and pushed.
-- **Tags are immutable.** `release-module.sh` fails when a tag exists but the module directory changed since — the "bump the version file" guard. Never delete or move a pushed tag; module zips are cached and checksummed downstream.
-- **Respins** (a local fix between upstream releases): tag a prerelease of the next patch, e.g. `core/v1.7.14-m1` — sorts above `v1.7.13` and below upstream's future `v1.7.14`, so MVS stays sane.
-- When upstream reaches v2 (they already tag `v2.0.0-prerelease*`), the module path needs the `/v2` suffix (`github.com/neria-cloud/meridian/transports/v2`).
+- A checkout of upstream `maximhq/bifrost` with HEAD at the base tag:
+  `git -C <upstream> checkout ent-vX.Y.Z-base`
+- A clone of this repository on `main`, clean.
+- `bifrost-prep` built from `neria-cloud/bifrost-prep` (`go build -o bifrost-prep ./cmd/bifrost-prep`).
+- Go at least as new as the `go` directive of the upstream modules, or `GOTOOLCHAIN=auto`.
+- Push rights to `origin`.
 
-## What the chain does per module (`scripts/release-chain.sh`)
+## Steps
 
-1. **Drops local filesystem `replace` directives** for internal modules (`go mod edit -dropreplace`). The absolute-path replaces in this tree are a development convenience; `go.work` (gitignored) is the supported dev mechanism, and a released go.mod must resolve by version alone.
-2. **Pins internal requires** to the sibling `version` files (`go mod edit -require=…@vX.Y.Z`) and runs `go mod tidy`. Stale pins (e.g. `core v1.7.10` while `core/version` says `1.7.13`) are corrected here automatically.
-3. **Builds and vets** with `GOWORK=off` — the release-parity check the workspace would otherwise mask. For `transports`, a throwaway stub satisfies the `//go:embed all:ui` in package `main` (the real UI is injected at Docker-image build; the dir is gitignored, so the stub is never committed).
-4. **Commits the pin bump** (`chore(release): <module>: pin internal deps for <tag>`) and pushes it to the release branch.
-5. **Tags** `<module>/v<version>` (annotated; `<module>/changelog.md` becomes the tag message body) and pushes the tag.
+```sh
+# 1. see what the base needs
+./bifrost-prep release --dry-run <upstream> <this clone>
 
-The chain is idempotent: already-tagged, unchanged modules are skipped, so a partial failure resumes where it stopped, and a wave that bumps only `transports/version` tags only transports.
+# 2. produce the sync commits and tags locally
+GOTOOLCHAIN=auto ./bifrost-prep release -v --exclude ':memory:' --exclude redis-certs <upstream> <this clone>
 
-Tests are deliberately not part of the chain — core tests need provider API keys, framework tests need docker services. Keep them in dedicated workflows and make those required checks on `main`.
+# 3. review
+git -C <this clone> log --oneline -3
+git -C <this clone> tag --points-at HEAD~1   # nothing: main is never tagged
+git -C <this clone> show <dir>/v<ver>:<dir>/go.mod
 
-## Running
-
-CI: `.github/workflows/release-modules.yml` triggers on pushes to `main` touching any `*/version` (plus manual `workflow_dispatch`). Pin-bump commits touch only `go.mod`/`go.sum`, so they cannot retrigger the workflow; a concurrency group serializes overlapping runs.
-
-### CI authentication
-
-The workflow pushes commits and tags using a repository secret `RELEASE_TOKEN`, **not** the default `GITHUB_TOKEN`. Two situations both lead here:
-
-- an org (or enterprise) Actions policy enforces a read-only ceiling on `GITHUB_TOKEN`, so "Read and write permissions" is unavailable at the repo level even to a repo admin, or
-- it's available, but a PAT scoped to this one repo has a smaller blast radius than raising the org-wide default token permission for every repo.
-
-Set it up once:
-
-1. Create a token scoped to **only this repository** with **Contents: Read and write**: GitHub → Settings → Developer settings → **Fine-grained personal access tokens** → New token → Resource owner `neria-cloud` → Repository access: "Only select repositories" → `meridian` → Repository permissions → Contents: Read and write.
-2. Add it as a secret on this repo: Settings → Secrets and variables → Actions → New repository secret → name `RELEASE_TOKEN`, value the token from step 1. (Or `gh secret set RELEASE_TOKEN --repo neria-cloud/meridian` from a shell that has the token — never paste a token into a chat session.)
-3. Re-run the workflow. The "Require RELEASE_TOKEN" step fails fast with a clear message if the secret is still unset.
-
-If instead an org admin raises the org-level default to "Read and write permissions" (Organization Settings → Actions → General → Workflow permissions — note this changes the default for every repo in the org, not just this one), switch the workflow's top-level `permissions:` block to `contents: write` and the git-remote step back to `${{ github.token }}`; the PAT is then unnecessary.
-
-Locally:
-
-```bash
-scripts/release-chain.sh                    # full release against origin
-RELEASE_NO_PUSH=1 scripts/release-chain.sh  # dry run: local commits + tags, nothing pushed
+# 4. push tags then main (or add --push to step 2)
+GOTOOLCHAIN=auto ./bifrost-prep release --push --exclude ':memory:' --exclude redis-certs <upstream> <this clone>
 ```
 
-Requirements: `go`, `git` push rights, `jq`.
+The `--exclude` flags drop git-ignored test leftovers that live in the upstream checkout.
 
-## What a release produces
+A re-run on the same base is a no-op: existing tags are classified and skipped, `main`
+reproduces itself. A stopped run is resumed by running again.
 
-Each tagged module resolves as an ordinary Go module dependency, e.g.:
+## Reading the report
 
-```go
-require github.com/neria-cloud/meridian/transports v1.6.11
-```
+- `new` / `created`: tags this run makes.
+- `existing-parity`: already published with upstream's pins.
+- `existing-divergent`: already published with other pins; left alone, listed with the
+  differing pins under `-v`.
+- `no-upstream`: a version file whose tag upstream never made; nothing is invented.
+- `parity:` what `transports` on `main` links versus upstream's pins, with the tag to blame.
 
-`go mod tidy`/`go get` on that pin pulls the rest of the internal graph (`core`, `framework`, the plugins transports depends on) transitively, at the exact versions the release chain pinned — no `replace` directives are needed by anything importing this repository's modules, because the chain removes them before tagging (see step 1 above).
+## Meridian-only fixes
 
-If this repository is private, `GOPRIVATE=github.com/neria-cloud/*` and git auth (`git config --global url."https://x-access-token:${GH_TOKEN}@github.com/neria-cloud/".insteadOf "https://github.com/neria-cloud/"`, or SSH) are needed wherever these modules are fetched. If public, proxy.golang.org and the checksum DB work with zero configuration (a brand-new tag can take a few minutes to appear through the proxy; `GOPRIVATE` or `GOPROXY=direct` bypasses the wait).
+Tag a pre-release of the next patch (`core/v1.7.14-m1`) by hand on a commit parented on the
+current sync commit; never reuse an upstream number. Consumers pin the `-m1` version
+explicitly.
 
-## Failure modes
+## What must never happen
 
-- "tag exists but module differs" — content changed without bumping `<module>/version`; bump it.
-- `go mod tidy` cannot find an internal version — the dependee's tag is not pushed yet; release in order (the chain does) or wait out propagation (the scripts retry).
-- Workflow cannot push — enable read/write workflow permissions or switch the token to a PAT.
-- A broken module got tagged — fix forward and respin as `vX.Y.(Z+1)-m1`; never delete the tag.
-- Example modules under `examples/plugins/` keep their local replaces on purpose: they are never released as modules, and the framework `.so`-plugin fixture is version-bumped (not de-replaced) by the chain, mirroring upstream's `release-framework.sh`.
+- Moving, deleting or re-creating a pushed tag. `sum.golang.org` has it forever.
+- Editing Go files on `main` by hand; `main` is a mirror.
+- Bumping a pin to a version file.
