@@ -264,19 +264,6 @@ type HTTPTransportPlugin interface {
 	HTTPTransportStreamChunkHook(ctx *BifrostContext, req *HTTPRequest, chunk *BifrostStreamChunk) (*BifrostStreamChunk, error)
 }
 
-// StreamInterceptionError carries a structured client error when an HTTP stream plugin terminates a stream.
-type StreamInterceptionError struct {
-	BifrostError *BifrostError
-}
-
-// Error returns the best available client message for callers that only understand Go errors.
-func (e *StreamInterceptionError) Error() string {
-	if e != nil && e.BifrostError != nil && e.BifrostError.Error != nil && e.BifrostError.Error.Message != "" {
-		return e.BifrostError.Error.Message
-	}
-	return "stream interception failed"
-}
-
 type LLMPlugin interface {
 	BasePlugin
 
@@ -379,7 +366,7 @@ type ConfigMarshallerPlugin interface {
 	BasePlugin
 
 	// MarshalConfigForStorage converts the raw config map (as received from the API)
-	// into the canonical DB-storage format (e.g. *SecretVar fields as plain strings).
+	// into the canonical DB-storage format (e.g. *EnvVar fields as plain strings).
 	MarshalConfigForStorage(config map[string]any) (map[string]any, error)
 	// RedactConfig converts a stored config map into the API-response format,
 	// masking sensitive literal values.
@@ -417,8 +404,9 @@ type ObservabilityPlugin interface {
 	// The context passed is a fresh background context, not the request context.
 	//
 	// Retention: implementations MUST NOT retain the *Trace pointer after Inject
-	// returns. The caller releases the underlying trace back to a sync.Pool
-	// immediately after Inject completes. If a plugin needs to forward the trace
-	// asynchronously, it must copy the data it needs before returning.
+	// returns. The caller releases the trace back to a sync.Pool immediately after
+	// Inject completes, so any background goroutine that still references it will
+	// race with pool reuse. If a plugin needs to forward the trace asynchronously,
+	// it must copy the data it needs before returning.
 	Inject(ctx context.Context, trace *Trace) error
 }

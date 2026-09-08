@@ -482,14 +482,6 @@ func ModifyExpectationsForProvider(expectations ResponseExpectations, provider s
 		expectations.ShouldHaveUsageStats = true
 		expectations.ShouldHaveLatency = true
 
-	case schemas.DeepSeek:
-		expectations.ShouldHaveUsageStats = true
-		expectations.ShouldHaveLatency = true
-
-	case schemas.Wafer:
-		expectations.ShouldHaveUsageStats = true
-		expectations.ShouldHaveLatency = true
-
 	case schemas.OpenRouter:
 		// OpenRouter proxies to multiple providers; returns OpenAI-compatible fields
 		expectations.ShouldHaveUsageStats = true
@@ -538,12 +530,6 @@ func ModifyExpectationsForProvider(expectations ResponseExpectations, provider s
 
 	case schemas.Runway:
 		// Runway is primarily video/image generation
-		expectations.ShouldHaveUsageStats = false
-		expectations.ShouldHaveTimestamps = false
-		expectations.ShouldHaveLatency = true
-
-	case schemas.Runware:
-		// Runware is image generation only
 		expectations.ShouldHaveUsageStats = false
 		expectations.ShouldHaveTimestamps = false
 		expectations.ShouldHaveLatency = true

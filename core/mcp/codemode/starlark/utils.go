@@ -300,22 +300,15 @@ func extractTextFromMCPResponse(toolResponse *mcp.CallToolResult, toolName strin
 }
 
 // createToolResponseMessage creates a tool response message with the execution result.
-// isError marks the result failed so a CodeMode lookup or sandbox failure is not
-// replayed to the model as a successful answer.
-func createToolResponseMessage(toolCall schemas.ChatAssistantMessageToolCall, responseText string, isError bool) *schemas.ChatMessage {
-	toolMsg := &schemas.ChatToolMessage{
-		ToolCallID: toolCall.ID,
-	}
-	if isError {
-		toolMsg.IsError = schemas.Ptr(true)
-	}
-
+func createToolResponseMessage(toolCall schemas.ChatAssistantMessageToolCall, responseText string) *schemas.ChatMessage {
 	return &schemas.ChatMessage{
 		Role: schemas.ChatMessageRoleTool,
 		Content: &schemas.ChatMessageContent{
 			ContentStr: &responseText,
 		},
-		ChatToolMessage: toolMsg,
+		ChatToolMessage: &schemas.ChatToolMessage{
+			ToolCallID: toolCall.ID,
+		},
 	}
 }
 

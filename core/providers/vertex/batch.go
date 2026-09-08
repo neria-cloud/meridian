@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
-	"github.com/neria-cloud/meridian/core/providers/gemini"
 	providerUtils "github.com/neria-cloud/meridian/core/providers/utils"
 	"github.com/neria-cloud/meridian/core/schemas"
 )
@@ -169,9 +168,8 @@ func ToVertexBatchCreateRequest(request *schemas.BifrostBatchCreateRequest, disp
 }
 
 // vertexConvertRequestsToJSONL converts inline batch request items to Vertex batch JSONL.
-// Each body is converted to Vertex's native GenerateContentRequest shape (the same converter
-// the Gemini provider uses), so OpenAI-style "messages" become "contents"; batchPredictionJobs
-// expects {"request": {contents...}}. Each custom_id is carried in the request labels.
+// Bodies are passed through as-is (callers provide Gemini-native request bodies, mirroring
+// the Anthropic/Bedrock providers); each custom_id is carried in request labels.
 func vertexConvertRequestsToJSONL(requests []schemas.BatchRequestItem) ([]byte, error) {
 	var buf bytes.Buffer
 	for i, item := range requests {
@@ -182,26 +180,6 @@ func vertexConvertRequestsToJSONL(requests []schemas.BatchRequestItem) ([]byte, 
 		if body == nil {
 			return nil, fmt.Errorf("batch request item %d (custom_id %q) has no body", i, item.CustomID)
 		}
-
-		// OpenAI-style bodies (with "messages") are converted to Gemini's request shape; native
-		// Gemini/Vertex bodies pass through verbatim so caller-supplied fields (tools, toolConfig,
-		// labels, cachedContent, ...) are not dropped by the lossy struct conversion.
-		if _, isOpenAI := body["messages"]; isOpenAI {
-			geminiReq, err := gemini.ToGeminiBatchGenerateContentRequest(body)
-			if err != nil {
-				return nil, fmt.Errorf("failed to convert batch request item %d (custom_id %q): %w", i, item.CustomID, err)
-			}
-			reqBytes, err := providerUtils.MarshalSorted(geminiReq)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal batch request item %d (custom_id %q): %w", i, item.CustomID, err)
-			}
-			converted := map[string]interface{}{}
-			if err := sonic.Unmarshal(reqBytes, &converted); err != nil {
-				return nil, fmt.Errorf("failed to unmarshal batch request item %d (custom_id %q): %w", i, item.CustomID, err)
-			}
-			body = converted
-		}
-
 		if item.CustomID != "" {
 			// Shallow-copy before injecting labels so the caller's map is not mutated.
 			withLabels := make(map[string]interface{}, len(body)+1)
@@ -218,7 +196,6 @@ func vertexConvertRequestsToJSONL(requests []schemas.BatchRequestItem) ([]byte, 
 			withLabels["labels"] = labels
 			body = withLabels
 		}
-
 		line, err := providerUtils.MarshalSorted(map[string]interface{}{"request": body})
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal batch request item %d (custom_id %q): %w", i, item.CustomID, err)

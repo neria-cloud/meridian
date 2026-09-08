@@ -82,45 +82,18 @@ type HTTPClientFactory struct {
 	fasthttpClients map[ClientPurpose]*fasthttp.Client
 	httpClients     map[ClientPurpose]*http.Client
 
-	// Fasthttp read/write buffer sizes. Zero unless a caller opts in via
-	// WithFasthttpBufferSizes; when set, applied to the SCIM client only
-	// (see createFasthttpClient).
-	readBufferSize  int
-	writeBufferSize int
-
 	logger schemas.Logger
-}
-
-// FactoryOption customizes an HTTPClientFactory at construction time.
-type FactoryOption func(*HTTPClientFactory)
-
-// WithFasthttpBufferSizes overrides the fasthttp read/write buffer sizes used for
-// created clients. Non-positive values leave the corresponding field at zero, which
-// selects fasthttp's default buffer size.
-func WithFasthttpBufferSizes(read, write int) FactoryOption {
-	return func(f *HTTPClientFactory) {
-		if read > 0 {
-			f.readBufferSize = read
-		}
-		if write > 0 {
-			f.writeBufferSize = write
-		}
-	}
 }
 
 // NewHTTPClientFactory creates a new HTTP client factory with the given proxy configuration.
 // Pass nil for proxyConfig if proxy is not yet configured.
-func NewHTTPClientFactory(proxyConfig *GlobalProxyConfig, logger schemas.Logger, opts ...FactoryOption) *HTTPClientFactory {
-	f := &HTTPClientFactory{
+func NewHTTPClientFactory(proxyConfig *GlobalProxyConfig, logger schemas.Logger) *HTTPClientFactory {
+	return &HTTPClientFactory{
 		proxyConfig:     proxyConfig,
 		fasthttpClients: make(map[ClientPurpose]*fasthttp.Client, 3),
 		httpClients:     make(map[ClientPurpose]*http.Client, 3),
 		logger:          logger,
 	}
-	for _, opt := range opts {
-		opt(f)
-	}
-	return f
 }
 
 // UpdateProxyConfig updates the proxy configuration and recreates all cached clients.
@@ -251,19 +224,6 @@ func (f *HTTPClientFactory) createFasthttpClient(purpose ClientPurpose) *fasthtt
 		RetryIfErr:          StaleConnectionRetryIfErr,
 	}
 
-	// Larger header buffers only for SCIM/OAuth, and only when a caller opted in via
-	// WithFasthttpBufferSizes: IdP token endpoints can return response headers
-	// exceeding fasthttp's 4KB default ("small read buffer"). Every other purpose,
-	// and any factory whose caller didn't set a size, keeps fasthttp's default.
-	if purpose == ClientPurposeSCIM {
-		if f.readBufferSize > 0 {
-			client.ReadBufferSize = f.readBufferSize
-		}
-		if f.writeBufferSize > 0 {
-			client.WriteBufferSize = f.writeBufferSize
-		}
-	}
-
 	// Configure proxy if enabled for this purpose
 	if f.isProxyEnabledForPurpose(purpose) {
 		f.configureFasthttpProxy(client)
@@ -292,18 +252,8 @@ func (f *HTTPClientFactory) createFasthttpClient(purpose ClientPurpose) *fasthtt
 // use POST, so without this they fail immediately on stale connections. Retrying is safe here
 // because the error occurs during response header parsing — before the server processes the
 // new request, or on a connection the server has already closed.
-// maxStaleConnRetries bounds how many times a single request will redial on a stale
-// pooled connection. With FIFO pooling, the oldest connection is tried first, and when
-// the upstream has a short keep-alive (e.g. vLLM's default 5s) several pooled connections
-// can be dead at once - so a single retry can hit a second stale connection and still fail
-// (see https://github.com/maximhq/bifrost/issues/4496). A small bound lets the request walk
-// past a few dead connections to a live one while staying well under fasthttp's internal
-// attempt cap. Retrying is safe here because the failure occurs before the server processes
-// the request (during dial / response-header parsing).
-const maxStaleConnRetries = 3
-
 func StaleConnectionRetryIfErr(_ *fasthttp.Request, attempts int, err error) (resetTimeout bool, retry bool) {
-	if attempts > maxStaleConnRetries {
+	if attempts > 1 {
 		return false, false
 	}
 	if err == nil {
@@ -362,24 +312,17 @@ func (f *HTTPClientFactory) configureFasthttpProxy(client *fasthttp.Client) {
 	if dialFunc != nil {
 		client.Dial = func(addr string) (net.Conn, error) {
 			if proxyCfg.NoProxy != "" {
-				if shouldBypassProxy(dialAddrHost(addr), proxyCfg.NoProxy) {
+				host := strings.Split(addr, ":")[0]
+				if host == "" {
+					host = addr
+				}
+				if shouldBypassProxy(host, proxyCfg.NoProxy) {
 					return net.Dial("tcp", addr)
 				}
 			}
 			return dialFunc(addr)
 		}
 	}
-}
-
-// dialAddrHost extracts the host from a dial target for no_proxy matching.
-// SplitHostPort unwraps IPv6 brackets ("[::1]:8080" -> "::1"); naive splitting
-// on ":" would mangle IPv6 literals.
-func dialAddrHost(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil || host == "" {
-		host = strings.Trim(addr, "[]")
-	}
-	return host
 }
 
 // createHTTPClient creates a new standard net/http client with appropriate proxy settings

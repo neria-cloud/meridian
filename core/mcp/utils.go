@@ -71,19 +71,10 @@ func (m *MCPManager) GetToolPerClient(ctx context.Context) map[string][]schemas.
 
 	m.logger.Debug("%s GetToolPerClient: Total clients in manager: %d, Filter: %v", MCPLogPrefix, len(m.clientMap), includeClients)
 
-	// Collect and sort client names for deterministic tool ordering
-	clientNames := make([]string, 0, len(m.clientMap))
-	clientsByName := make(map[string]*schemas.MCPClientState, len(m.clientMap))
-	for _, client := range m.clientMap {
-		name := client.ExecutionConfig.Name
-		clientNames = append(clientNames, name)
-		clientsByName[name] = client
-	}
-	slices.Sort(clientNames)
-
 	tools := make(map[string][]schemas.ChatTool)
-	for _, clientName := range clientNames {
-		client := clientsByName[clientName]
+	for _, client := range m.clientMap {
+		// Use client name as the key (not ID)
+		clientName := client.ExecutionConfig.Name
 		clientID := client.ExecutionConfig.ID
 
 		m.logger.Debug("%s Evaluating client %s (ID: %s) for tools", MCPLogPrefix, clientName, clientID)
@@ -100,19 +91,12 @@ func (m *MCPManager) GetToolPerClient(ctx context.Context) map[string][]schemas.
 			continue
 		}
 
-		// Collect and sort tool names for deterministic ordering
-		toolNames := make([]string, 0, len(client.ToolMap))
-		for toolName := range client.ToolMap {
-			toolNames = append(toolNames, toolName)
-		}
-		slices.Sort(toolNames)
-
+		// Add all tools from this client
 		// FILTERING HIERARCHY (restrictive, not permissive):
 		// 1. Client-level configuration (ToolsToExecute) - Global allow-list, most restrictive
 		// 2. Request context (MCPContextKeyIncludeTools) - Can only further narrow, not expand
 		// Context filtering CANNOT override client configuration - it can only be more restrictive.
-		for _, toolName := range toolNames {
-			tool := client.ToolMap[toolName]
+		for toolName, tool := range client.ToolMap {
 			// First check: Client configuration is the global allow-list
 			// If client config blocks a tool, it CANNOT be overridden by context
 			if shouldSkipToolForConfig(toolName, client.ExecutionConfig) {
@@ -630,22 +614,15 @@ func extractTextFromMCPResponse(toolResponse *mcp.CallToolResult, toolName strin
 }
 
 // createToolResponseMessage creates a tool response message with the execution result.
-// isError carries the MCP protocol's own tool-failure signal (mcp.CallToolResult.IsError),
-// which reports that the tool ran and failed -- distinct from a transport-level error.
-func createToolResponseMessage(toolCall schemas.ChatAssistantMessageToolCall, responseText string, isError bool) *schemas.ChatMessage {
-	toolMsg := &schemas.ChatToolMessage{
-		ToolCallID: toolCall.ID,
-	}
-	if isError {
-		toolMsg.IsError = schemas.Ptr(true)
-	}
-
+func createToolResponseMessage(toolCall schemas.ChatAssistantMessageToolCall, responseText string) *schemas.ChatMessage {
 	return &schemas.ChatMessage{
 		Role: schemas.ChatMessageRoleTool,
 		Content: &schemas.ChatMessageContent{
 			ContentStr: &responseText,
 		},
-		ChatToolMessage: toolMsg,
+		ChatToolMessage: &schemas.ChatToolMessage{
+			ToolCallID: toolCall.ID,
+		},
 	}
 }
 

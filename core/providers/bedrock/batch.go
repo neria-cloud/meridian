@@ -283,11 +283,6 @@ func ToBedrockBatchJobRetrieveResponse(resp *schemas.BifrostBatchRetrieveRespons
 		}
 	}
 
-	// Map the failure reason back to Bedrock's native message field.
-	if resp.Errors != nil && len(resp.Errors.Data) > 0 {
-		result.Message = resp.Errors.Data[0].Message
-	}
-
 	if resp.CreatedAt > 0 {
 		t := time.Unix(resp.CreatedAt, 0)
 		result.SubmitTime = &t

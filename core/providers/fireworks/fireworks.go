@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/neria-cloud/meridian/core/providers/anthropic"
 	"github.com/neria-cloud/meridian/core/providers/openai"
 	providerUtils "github.com/neria-cloud/meridian/core/providers/utils"
 	schemas "github.com/neria-cloud/meridian/core/schemas"
@@ -34,7 +33,7 @@ func NewFireworksProvider(config *schemas.ProviderConfig, logger schemas.Logger)
 		ReadTimeout:         requestTimeout,
 		WriteTimeout:        requestTimeout,
 		MaxConnsPerHost:     config.NetworkConfig.MaxConnsPerHost,
-		MaxIdleConnDuration: time.Second * time.Duration(config.NetworkConfig.KeepAliveTimeoutInSeconds),
+		MaxIdleConnDuration: 30 * time.Second,
 		MaxConnWaitTimeout:  requestTimeout,
 		MaxConnDuration:     time.Second * time.Duration(schemas.DefaultMaxConnDurationInSeconds),
 		ConnPoolStrategy:    fasthttp.FIFO,
@@ -66,34 +65,21 @@ func (provider *FireworksProvider) GetProviderKey() schemas.ModelProvider {
 	return schemas.Fireworks
 }
 
-// anthropicHeaders builds the auth headers for Fireworks' Anthropic-compatible endpoint.
-func (provider *FireworksProvider) anthropicHeaders(key schemas.Key) map[string]string {
-	return openai.BearerAuthHeader(key)
-}
-
-// ListModels lists models for Fireworks AI from each key's configured models and aliases.
-// Fireworks serverless has no usable OpenAI-style /v1/models endpoint (it returns
-// "Error listing deployed models"), so models are sourced from config rather than a live
-// API call, mirroring the Replicate non-deployment path.
+// ListModels performs a list models request to Fireworks AI's API.
 func (provider *FireworksProvider) ListModels(ctx *schemas.BifrostContext, keys []schemas.Key, request *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
-	return providerUtils.HandleMultipleListModelsRequests(ctx, keys, request, provider.listModelsByKey)
+	return openai.HandleOpenAIListModelsRequest(
+		ctx,
+		provider.client,
+		request,
+		provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/models"),
+		keys,
+		provider.networkConfig.ExtraHeaders,
+		schemas.Fireworks,
+		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+	)
 }
 
-// listModelsByKey builds the model list for a single key from its configured models and
-// aliases, without calling the upstream API. The configured set is the full catalog we
-// can produce (Fireworks has no enumerable live endpoint), so the filtered pipeline path
-// is forced regardless of request.Unfiltered — the pipeline skips config backfill when
-// unfiltered (it assumes a live response supplies the catalog), which would otherwise
-// yield an empty list and drop configured models/aliases from the unfiltered catalog view.
-func (provider *FireworksProvider) listModelsByKey(_ *schemas.BifrostContext, key schemas.Key, _ *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
-	return (&openai.OpenAIListModelsResponse{}).ToBifrostListModelsResponse(
-		schemas.Fireworks,
-		key.Models,
-		key.BlacklistedModels,
-		key.Aliases,
-		false,
-	), nil
-}
 
 // TextCompletion performs a text completion request to the Fireworks AI API.
 func (provider *FireworksProvider) TextCompletion(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostTextCompletionRequest) (*schemas.BifrostTextCompletionResponse, *schemas.BifrostError) {
@@ -102,7 +88,7 @@ func (provider *FireworksProvider) TextCompletion(ctx *schemas.BifrostContext, k
 		provider.client,
 		provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/completions"),
 		request,
-		openai.BearerAuthHeader(key),
+		key,
 		provider.networkConfig.ExtraHeaders,
 		provider.GetProviderKey(),
 		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
@@ -115,12 +101,16 @@ func (provider *FireworksProvider) TextCompletion(ctx *schemas.BifrostContext, k
 
 // TextCompletionStream performs a streaming text completion request to the Fireworks AI API.
 func (provider *FireworksProvider) TextCompletionStream(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, postHookSpanFinalizer func(context.Context), key schemas.Key, request *schemas.BifrostTextCompletionRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	var authHeader map[string]string
+	if v := key.Value.GetValue(); v != "" {
+		authHeader = map[string]string{"Authorization": "Bearer " + v}
+	}
 	return openai.HandleOpenAITextCompletionStreaming(
 		ctx,
 		provider.streamingClient,
 		provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/completions"),
 		request,
-		openai.BearerAuthHeader(key),
+		authHeader,
 		provider.networkConfig.ExtraHeaders,
 		provider.networkConfig.StreamIdleTimeoutInSeconds,
 		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
@@ -137,35 +127,16 @@ func (provider *FireworksProvider) TextCompletionStream(ctx *schemas.BifrostCont
 
 // ChatCompletion performs a chat completion request to the Fireworks AI API.
 func (provider *FireworksProvider) ChatCompletion(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
-	if anthropic.ResolveUseAnthropicEndpoints(ctx, key) {
-		return anthropic.HandleAnthropicChatCompletionRequest(
-			ctx,
-			provider.client,
-			provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/messages"),
-			request,
-			anthropic.AnthropicRequestBuildConfig{
-				Provider:                  schemas.Fireworks,
-				ShouldSendBackRawRequest:  provider.sendBackRawRequest,
-				ShouldSendBackRawResponse: provider.sendBackRawResponse,
-			},
-			provider.anthropicHeaders(key),
-			provider.networkConfig.ExtraHeaders,
-			nil,
-			provider.logger,
-		)
-	}
-
 	return openai.HandleOpenAIChatCompletionRequest(
 		ctx,
 		provider.client,
 		provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/chat/completions"),
 		request,
-		openai.BearerAuthHeader(key),
+		key,
 		provider.networkConfig.ExtraHeaders,
 		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
 		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
 		provider.GetProviderKey(),
-		nil,
 		nil,
 		nil,
 		provider.logger,
@@ -177,50 +148,23 @@ func (provider *FireworksProvider) ChatCompletion(ctx *schemas.BifrostContext, k
 // Uses Fireworks AI's OpenAI-compatible streaming format.
 // Returns a channel containing BifrostStreamChunk objects representing the stream or an error if the request fails.
 func (provider *FireworksProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, postHookSpanFinalizer func(context.Context), key schemas.Key, request *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
-	if anthropic.ResolveUseAnthropicEndpoints(ctx, key) {
-		jsonData, bifrostErr := anthropic.BuildAnthropicChatRequestBody(ctx, request, anthropic.AnthropicRequestBuildConfig{
-			Provider:                  schemas.Fireworks,
-			IsStreaming:               true,
-			ShouldSendBackRawRequest:  provider.sendBackRawRequest,
-			ShouldSendBackRawResponse: provider.sendBackRawResponse,
-		})
-		if bifrostErr != nil {
-			return nil, bifrostErr
-		}
-
-		return anthropic.HandleAnthropicChatCompletionStreaming(
-			ctx,
-			provider.streamingClient,
-			provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/messages"),
-			jsonData,
-			provider.anthropicHeaders(key),
-			provider.networkConfig.ExtraHeaders,
-			provider.networkConfig.StreamIdleTimeoutInSeconds,
-			provider.networkConfig.BetaHeaderOverrides,
-			providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
-			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
-			schemas.Fireworks,
-			postHookRunner,
-			nil,
-			nil,
-			provider.logger,
-			postHookSpanFinalizer,
-		)
+	var authHeader map[string]string
+	if v := key.Value.GetValue(); v != "" {
+		authHeader = map[string]string{"Authorization": "Bearer " + v}
 	}
-
+	// Use shared OpenAI-compatible streaming logic
 	return openai.HandleOpenAIChatCompletionStreaming(
 		ctx,
 		provider.streamingClient,
 		provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/chat/completions"),
 		request,
-		openai.BearerAuthHeader(key),
+		authHeader,
 		provider.networkConfig.ExtraHeaders,
 		provider.networkConfig.StreamIdleTimeoutInSeconds,
 		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
 		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
 		schemas.Fireworks,
 		postHookRunner,
-		nil,
 		nil,
 		nil,
 		nil,
@@ -233,35 +177,16 @@ func (provider *FireworksProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 
 // Responses performs a responses request to the Fireworks AI API.
 func (provider *FireworksProvider) Responses(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostResponsesRequest) (*schemas.BifrostResponsesResponse, *schemas.BifrostError) {
-	if anthropic.ResolveUseAnthropicEndpoints(ctx, key) {
-		return anthropic.HandleAnthropicResponsesRequest(
-			ctx,
-			provider.client,
-			provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/messages"),
-			request,
-			anthropic.AnthropicRequestBuildConfig{
-				Provider:                  schemas.Fireworks,
-				ShouldSendBackRawRequest:  provider.sendBackRawRequest,
-				ShouldSendBackRawResponse: provider.sendBackRawResponse,
-			},
-			provider.anthropicHeaders(key),
-			provider.networkConfig.ExtraHeaders,
-			nil,
-			provider.logger,
-		)
-	}
-
 	return openai.HandleOpenAIResponsesRequest(
 		ctx,
 		provider.client,
 		provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/responses"),
 		request,
-		openai.BearerAuthHeader(key),
+		key,
 		provider.networkConfig.ExtraHeaders,
 		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
 		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
 		provider.GetProviderKey(),
-		nil,
 		nil,
 		nil,
 		provider.logger,
@@ -270,50 +195,22 @@ func (provider *FireworksProvider) Responses(ctx *schemas.BifrostContext, key sc
 
 // ResponsesStream performs a streaming responses request to the Fireworks AI API.
 func (provider *FireworksProvider) ResponsesStream(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, postHookSpanFinalizer func(context.Context), key schemas.Key, request *schemas.BifrostResponsesRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
-	if anthropic.ResolveUseAnthropicEndpoints(ctx, key) {
-		jsonData, bifrostErr := anthropic.BuildAnthropicResponsesRequestBody(ctx, request, anthropic.AnthropicRequestBuildConfig{
-			Provider:                  schemas.Fireworks,
-			IsStreaming:               true,
-			ShouldSendBackRawRequest:  provider.sendBackRawRequest,
-			ShouldSendBackRawResponse: provider.sendBackRawResponse,
-		})
-		if bifrostErr != nil {
-			return nil, bifrostErr
-		}
-
-		return anthropic.HandleAnthropicResponsesStream(
-			ctx,
-			provider.streamingClient,
-			provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/messages"),
-			jsonData,
-			provider.anthropicHeaders(key),
-			provider.networkConfig.ExtraHeaders,
-			provider.networkConfig.StreamIdleTimeoutInSeconds,
-			provider.networkConfig.BetaHeaderOverrides,
-			providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
-			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
-			provider.GetProviderKey(),
-			postHookRunner,
-			nil,
-			nil,
-			provider.logger,
-			postHookSpanFinalizer,
-		)
+	var authHeader map[string]string
+	if v := key.Value.GetValue(); v != "" {
+		authHeader = map[string]string{"Authorization": "Bearer " + v}
 	}
-
 	return openai.HandleOpenAIResponsesStreaming(
 		ctx,
 		provider.streamingClient,
 		provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/responses"),
 		request,
-		openai.BearerAuthHeader(key),
+		authHeader,
 		provider.networkConfig.ExtraHeaders,
 		provider.networkConfig.StreamIdleTimeoutInSeconds,
 		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
 		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
 		provider.GetProviderKey(),
 		postHookRunner,
-		nil,
 		nil,
 		nil,
 		nil,
@@ -330,7 +227,7 @@ func (provider *FireworksProvider) Embedding(ctx *schemas.BifrostContext, key sc
 		provider.client,
 		provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/embeddings"),
 		request,
-		openai.BearerAuthHeader(key),
+		key,
 		provider.networkConfig.ExtraHeaders,
 		provider.GetProviderKey(),
 		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),

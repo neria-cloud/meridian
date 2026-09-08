@@ -92,23 +92,24 @@ func ConvertBedrockRequestsToJSONL(requests []schemas.BatchRequestItem, modelID 
 
 	// Iterate over the requests
 	for _, req := range requests {
-		// Build the Bedrock batch request format. modelId belongs at the job
-		// level, not inside modelInput, so the record only carries recordId and
-		// the raw model invocation body.
-		modelInput := map[string]interface{}{}
+		// Build the Bedrock batch request format
 		bedrockReq := map[string]interface{}{
-			"recordId":   req.CustomID,
-			"modelInput": modelInput,
+			"recordId": req.CustomID,
+			"modelInput": map[string]interface{}{
+				"modelId": *modelID,
+			},
 		}
 
 		// If the request has a body, use it as the model input parameters
 		if req.Body != nil {
+			modelInput := bedrockReq["modelInput"].(map[string]interface{})
 			for k, v := range req.Body {
-				if k != "model" { // model is set at the job level, not per-record
+				if k != "model" { // Don't override modelId
 					modelInput[k] = v
 				}
 			}
 		} else if req.Params != nil {
+			modelInput := bedrockReq["modelInput"].(map[string]interface{})
 			for k, v := range req.Params {
 				if k != "model" {
 					modelInput[k] = v

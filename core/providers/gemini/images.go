@@ -428,18 +428,15 @@ func ToGeminiImageGenerationRequest(bifrostReq *schemas.BifrostImageGenerationRe
 	// Convert parameters to generation config
 	if bifrostReq.Params != nil {
 
-		// Prefer explicit aspect_ratio; fall back to deriving aspect ratio + resolution from size.
-		imageConfig := &GeminiImageConfig{}
+		// Handle size conversion
 		if bifrostReq.Params.Size != nil && strings.ToLower(*bifrostReq.Params.Size) != "auto" {
 			aspectRatio, imageSize := utils.ConvertSizeToAspectRatioAndResolution(*bifrostReq.Params.Size)
-			imageConfig.AspectRatio = aspectRatio
-			imageConfig.ImageSize = imageSize
-		}
-		if bifrostReq.Params.AspectRatio != nil && *bifrostReq.Params.AspectRatio != "" {
-			imageConfig.AspectRatio = *bifrostReq.Params.AspectRatio
-		}
-		if imageConfig.AspectRatio != "" || imageConfig.ImageSize != "" {
-			geminiReq.GenerationConfig.ImageConfig = imageConfig
+			if imageSize != "" && aspectRatio != "" {
+				geminiReq.GenerationConfig.ImageConfig = &GeminiImageConfig{
+					ImageSize:   imageSize,
+					AspectRatio: aspectRatio,
+				}
+			}
 		}
 
 		// Handle extra parameters
@@ -547,11 +544,6 @@ func ToImagenImageGenerationRequest(bifrostReq *schemas.BifrostImageGenerationRe
 			if aspectRatio != "" {
 				req.Parameters.AspectRatio = &aspectRatio
 			}
-		}
-
-		// Explicit aspect_ratio overrides the size-derived ratio.
-		if bifrostReq.Params.AspectRatio != nil && *bifrostReq.Params.AspectRatio != "" {
-			req.Parameters.AspectRatio = bifrostReq.Params.AspectRatio
 		}
 
 		// Handle output format conversion to mimeType
@@ -777,10 +769,10 @@ func ToGeminiImageEditRequest(bifrostReq *schemas.BifrostImageEditRequest) *Gemi
 	if bifrostReq.Params != nil {
 		geminiReq.ExtraParams = bifrostReq.Params.ExtraParams
 
-		// Derive aspect ratio + resolution from size (edit params carry no typed aspect_ratio).
+		// Handle size conversion
 		if bifrostReq.Params.Size != nil && strings.ToLower(*bifrostReq.Params.Size) != "auto" {
 			aspectRatio, imageSize := utils.ConvertSizeToAspectRatioAndResolution(*bifrostReq.Params.Size)
-			if aspectRatio != "" || imageSize != "" {
+			if imageSize != "" && aspectRatio != "" {
 				geminiReq.GenerationConfig.ImageConfig = &GeminiImageConfig{
 					ImageSize:   imageSize,
 					AspectRatio: aspectRatio,
@@ -1060,18 +1052,6 @@ func ToImagenImageEditRequest(bifrostReq *schemas.BifrostImageEditRequest) *Gemi
 		if bifrostReq.Params.N != nil {
 			req.Parameters.SampleCount = bifrostReq.Params.N
 		}
-
-		// Derive aspect ratio + resolution from size (edit params carry no typed aspect_ratio).
-		if bifrostReq.Params.Size != nil && strings.ToLower(*bifrostReq.Params.Size) != "auto" {
-			aspectRatio, imageSize := utils.ConvertSizeToAspectRatioAndResolution(*bifrostReq.Params.Size)
-			if imageSize != "" {
-				req.Parameters.SampleImageSize = &imageSize
-			}
-			if aspectRatio != "" {
-				req.Parameters.AspectRatio = &aspectRatio
-			}
-		}
-
 		if bifrostReq.Params.OutputFormat != nil {
 			mimeType := convertOutputFormatToMimeType(*bifrostReq.Params.OutputFormat)
 			if mimeType != "" {

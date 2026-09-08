@@ -70,7 +70,7 @@ func TestGetModelPathStripsRegionWithARN(t *testing.T) {
 	arn := "arn:aws:bedrock:us-east-1::foundation-model"
 	key := schemas.Key{
 		BedrockKeyConfig: &schemas.BedrockKeyConfig{
-			ARN: schemas.NewSecretVar(arn),
+			ARN: schemas.NewEnvVar(arn),
 		},
 	}
 
@@ -105,7 +105,7 @@ func TestResolveBedrockRegion_AliasOverride(t *testing.T) {
 	aliasRegion := "us-west-2"
 	key := schemas.Key{
 		BedrockKeyConfig: &schemas.BedrockKeyConfig{
-			Region: schemas.NewSecretVar(keyRegion),
+			Region: schemas.NewEnvVar(keyRegion),
 		},
 	}
 
@@ -115,7 +115,7 @@ func TestResolveBedrockRegion_AliasOverride(t *testing.T) {
 		Key: "best-claude",
 		Config: &schemas.AliasConfig{
 			ModelID: "anthropic.claude-3-5-sonnet-20241022-v2:0",
-			Region:  schemas.NewSecretVar(aliasRegion),
+			Region:  schemas.NewEnvVar(aliasRegion),
 		},
 	})
 
@@ -143,7 +143,7 @@ func TestResolveBedrockARN_AliasOverride(t *testing.T) {
 	aliasARN := "arn:aws:bedrock:us-east-1:1234567890:inference-profile/us.anthropic.claude-3-7-sonnet"
 	key := schemas.Key{
 		BedrockKeyConfig: &schemas.BedrockKeyConfig{
-			ARN: schemas.NewSecretVar(keyARN),
+			ARN: schemas.NewEnvVar(keyARN),
 		},
 	}
 
@@ -159,7 +159,7 @@ func TestResolveBedrockARN_AliasOverride(t *testing.T) {
 		Config: &schemas.AliasConfig{
 			ModelID: "anthropic.claude-3-7-sonnet-20250219-v1:0",
 			BedrockAliasCfg: &schemas.BedrockAliasCfg{
-				InferenceProfileARN: schemas.NewSecretVar(aliasARN),
+				InferenceProfileARN: schemas.NewEnvVar(aliasARN),
 			},
 		},
 	})
@@ -174,7 +174,7 @@ func TestResolveBedrockARN_AliasOverride(t *testing.T) {
 		Config: &schemas.AliasConfig{
 			ModelID: "x",
 			BedrockAliasCfg: &schemas.BedrockAliasCfg{
-				InferenceProfileARN: schemas.NewSecretVar(""),
+				InferenceProfileARN: schemas.NewEnvVar(""),
 			},
 		},
 	})
@@ -187,7 +187,7 @@ func TestResolveBedrockRegion(t *testing.T) {
 	configuredRegion := "ap-southeast-1"
 	key := schemas.Key{
 		BedrockKeyConfig: &schemas.BedrockKeyConfig{
-			Region: schemas.NewSecretVar(configuredRegion),
+			Region: schemas.NewEnvVar(configuredRegion),
 		},
 	}
 	keyNoRegion := schemas.Key{BedrockKeyConfig: &schemas.BedrockKeyConfig{}}

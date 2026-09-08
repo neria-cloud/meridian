@@ -3,13 +3,14 @@ package vertex
 import (
 	"time"
 
-	"github.com/neria-cloud/meridian/core/providers/gemini"
 	providerUtils "github.com/neria-cloud/meridian/core/providers/utils"
 )
 
 // Vertex AI Embedding API types
 
 const (
+	DefaultVertexAnthropicVersion = "vertex-2023-10-16"
+
 	// VertexServiceTierHeader is the HTTP header used to request priority or flex processing on the global endpoint.
 	VertexServiceTierHeader = "X-Vertex-AI-LLM-Shared-Request-Type"
 )
@@ -242,10 +243,8 @@ type VertexValidationError struct {
 // VertexCountTokensResponse models the response payload for Vertex's Gemini-style countTokens.
 // Vertex uses camelCase unlike other request json body.
 type VertexCountTokensResponse struct {
-	TotalTokens             int32                        `json:"totalTokens,omitempty"`
-	TotalBillableCharacters int32                        `json:"totalBillableCharacters,omitempty"`
-	CachedContentTokenCount int32                        `json:"cachedContentTokenCount,omitempty"`
-	PromptTokensDetails     []*gemini.ModalityTokenCount `json:"promptTokensDetails,omitempty"`
+	TotalTokens             int32 `json:"totalTokens,omitempty"`
+	CachedContentTokenCount int32 `json:"cachedContentTokenCount,omitempty"`
 }
 
 // ================================ Batch Prediction API Types ================================

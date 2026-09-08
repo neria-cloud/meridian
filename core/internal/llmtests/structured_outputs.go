@@ -441,7 +441,7 @@ func RunStructuredOutputResponsesTest(t *testing.T, client *meridian.Bifrost, ct
 
 		responsesOperation := func() (*schemas.BifrostResponsesResponse, *schemas.BifrostError) {
 			typeStr := "object"
-			props := schemas.OrderedMapFromMap(structuredOutputSchema["properties"].(map[string]interface{}))
+			props := structuredOutputSchema["properties"].(map[string]interface{})
 			additionalProps := structuredOutputSchema["additionalProperties"].(bool)
 			responsesReq := &schemas.BifrostResponsesRequest{
 				Provider: testConfig.Provider,
@@ -455,7 +455,7 @@ func RunStructuredOutputResponsesTest(t *testing.T, client *meridian.Bifrost, ct
 							Name: meridian.Ptr("decision_schema"),
 							JSONSchema: &schemas.ResponsesTextConfigFormatJSONSchema{
 								Type:       &typeStr,
-								Properties: props,
+								Properties: &props,
 								Required:   structuredOutputSchema["required"].([]string),
 								AdditionalProperties: &schemas.AdditionalPropertiesStruct{
 									AdditionalPropertiesBool: &additionalProps,
@@ -572,7 +572,7 @@ func RunStructuredOutputResponsesStreamTest(t *testing.T, client *meridian.Bifro
 		}
 
 		typeStr := "object"
-		props := schemas.OrderedMapFromMap(structuredOutputSchema["properties"].(map[string]interface{}))
+		props := structuredOutputSchema["properties"].(map[string]interface{})
 		additionalProps := structuredOutputSchema["additionalProperties"].(bool)
 		request := &schemas.BifrostResponsesRequest{
 			Provider: testConfig.Provider,
@@ -586,7 +586,7 @@ func RunStructuredOutputResponsesStreamTest(t *testing.T, client *meridian.Bifro
 						Name: meridian.Ptr("decision_schema"),
 						JSONSchema: &schemas.ResponsesTextConfigFormatJSONSchema{
 							Type:       &typeStr,
-							Properties: props,
+							Properties: &props,
 							Required:   structuredOutputSchema["required"].([]string),
 							AdditionalProperties: &schemas.AdditionalPropertiesStruct{
 								AdditionalPropertiesBool: &additionalProps,

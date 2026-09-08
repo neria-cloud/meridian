@@ -85,16 +85,8 @@ func expandVertexModelPath(model, projectID, region string) string {
 	return fmt.Sprintf("projects/%s/locations/%s/publishers/google/models/%s", projectID, region, model)
 }
 
-// vertexAuthHeaders applies Vertex AI authentication to the request. When the key
-// carries an API key value, it is passed as the "key" query parameter (mirroring
-// the Gemini generation endpoints) and any Authorization header already set from
-// context extra headers is left intact. Otherwise an OAuth bearer token is fetched
-// from the key credentials and set on the Authorization header.
+// vertexAuthHeaders pulls an OAuth bearer token from the key and applies it.
 func vertexAuthHeaders(req *fasthttp.Request, key schemas.Key) *schemas.BifrostError {
-	if key.Value.GetValue() != "" {
-		req.URI().QueryArgs().Set("key", key.Value.GetValue())
-		return nil
-	}
 	tokenSource, err := getAuthTokenSource(key)
 	if err != nil {
 		return providerUtils.NewBifrostOperationError("error creating auth token source", err)
@@ -186,7 +178,7 @@ func (provider *VertexProvider) CachedContentCreate(ctx *schemas.BifrostContext,
 		return nil, bifrostErr
 	}
 	if resp.StatusCode() != fasthttp.StatusOK {
-		return nil, providerUtils.SetErrorLatency(parseVertexCachedContentError(resp), latency)
+		return nil, parseVertexCachedContentError(resp)
 	}
 
 	respBody, decErr := providerUtils.CheckAndDecodeBody(resp)
@@ -258,7 +250,7 @@ func (provider *VertexProvider) cachedContentListByKey(ctx *schemas.BifrostConte
 		return nil, latency, bifrostErr
 	}
 	if resp.StatusCode() != fasthttp.StatusOK {
-		return nil, latency, providerUtils.SetErrorLatency(parseVertexCachedContentError(resp), latency)
+		return nil, latency, parseVertexCachedContentError(resp)
 	}
 
 	respBody, decErr := providerUtils.CheckAndDecodeBody(resp)
@@ -331,7 +323,7 @@ func (provider *VertexProvider) cachedContentRetrieveByKey(ctx *schemas.BifrostC
 		return nil, latency, bifrostErr
 	}
 	if resp.StatusCode() != fasthttp.StatusOK {
-		return nil, latency, providerUtils.SetErrorLatency(parseVertexCachedContentError(resp), latency)
+		return nil, latency, parseVertexCachedContentError(resp)
 	}
 
 	respBody, decErr := providerUtils.CheckAndDecodeBody(resp)
@@ -435,7 +427,7 @@ func (provider *VertexProvider) cachedContentUpdateByKey(ctx *schemas.BifrostCon
 		return nil, latency, bifrostErr
 	}
 	if resp.StatusCode() != fasthttp.StatusOK {
-		return nil, latency, providerUtils.SetErrorLatency(parseVertexCachedContentError(resp), latency)
+		return nil, latency, parseVertexCachedContentError(resp)
 	}
 
 	respBody, decErr := providerUtils.CheckAndDecodeBody(resp)
@@ -520,7 +512,7 @@ func (provider *VertexProvider) cachedContentDeleteByKey(ctx *schemas.BifrostCon
 		return nil, latency, bifrostErr
 	}
 	if resp.StatusCode() != fasthttp.StatusOK {
-		return nil, latency, providerUtils.SetErrorLatency(parseVertexCachedContentError(resp), latency)
+		return nil, latency, parseVertexCachedContentError(resp)
 	}
 
 	return &schemas.BifrostCachedContentDeleteResponse{

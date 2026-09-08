@@ -54,7 +54,8 @@ func NewOrderedMapFromPairs(pairs ...Pair) *OrderedMap {
 }
 
 // OrderedMapFromMap creates an OrderedMap from a plain map.
-// Keys are sorted lexicographically to ensure deterministic ordering.
+// Key order is NOT guaranteed since Go maps have undefined iteration order.
+// Use this only when insertion order doesn't matter (e.g., for hashing).
 func OrderedMapFromMap(m map[string]interface{}) *OrderedMap {
 	if m == nil {
 		return nil
@@ -67,7 +68,6 @@ func OrderedMapFromMap(m map[string]interface{}) *OrderedMap {
 		om.keys = append(om.keys, k)
 		om.values[k] = v
 	}
-	sort.Strings(om.keys)
 	return om
 }
 

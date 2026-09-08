@@ -16,8 +16,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -91,9 +89,9 @@ func newTestProviderWithServer(t *testing.T, ts *httptest.Server) *BedrockProvid
 // testBedrockKey returns a minimal Key with a bearer value so makeStreamingRequest
 // skips IAM signing and proceeds to the HTTP call.
 func testBedrockKey() schemas.Key {
-	region := schemas.NewSecretVar("us-east-1")
+	region := schemas.NewEnvVar("us-east-1")
 	return schemas.Key{
-		Value: *schemas.NewSecretVar("test-api-key"),
+		Value: *schemas.NewEnvVar("test-api-key"),
 		BedrockKeyConfig: &schemas.BedrockKeyConfig{
 			Region: region,
 		},
@@ -109,12 +107,6 @@ func testBedrockCtx() *schemas.BifrostContext {
 func noopPostHookRunner(_ *schemas.BifrostContext, result *schemas.BifrostResponse, err *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
 	return result, err
 }
-
-// testConverseStreamModel is a non-Anthropic, non-OpenAI Bedrock model that routes through
-// the Converse streaming path (and thus the AWS EventStream decoder). OpenAI-family models
-// stream via the Mantle endpoint instead; Anthropic/Claude also route through Converse, but
-// Nova is used here to keep the EventStream-exception cases provider-agnostic.
-const testConverseStreamModel = "amazon.nova-lite-v1:0"
 
 // testChatRequest returns a minimal BifrostChatRequest for streaming tests.
 func testChatRequest() *schemas.BifrostChatRequest {
@@ -339,9 +331,7 @@ func TestChatCompletionStream_RetryableException_ChunkIsRetryable(t *testing.T) 
 			ctx := testBedrockCtx()
 			key := testBedrockKey()
 
-			req := testChatRequest()
-			req.Model = testConverseStreamModel
-			streamChan, bifrostErr := provider.ChatCompletionStream(ctx, noopPostHookRunner, nil, key, req)
+			streamChan, bifrostErr := provider.ChatCompletionStream(ctx, noopPostHookRunner, nil, key, testChatRequest())
 			require.Nil(t, bifrostErr, "expected EventStream exception to surface as a stream chunk")
 
 			require.NotNil(t, streamChan)
@@ -388,9 +378,7 @@ func TestChatCompletionStream_NonRetryableException_IsTerminal(t *testing.T) {
 	ctx := testBedrockCtx()
 	key := testBedrockKey()
 
-	req := testChatRequest()
-	req.Model = testConverseStreamModel
-	streamChan, bifrostErr := provider.ChatCompletionStream(ctx, noopPostHookRunner, nil, key, req)
+	streamChan, bifrostErr := provider.ChatCompletionStream(ctx, noopPostHookRunner, nil, key, testChatRequest())
 	require.Nil(t, bifrostErr, "expected EventStream exception to surface as a stream chunk")
 
 	require.NotNil(t, streamChan)
@@ -529,9 +517,7 @@ func TestResponsesStream_RetryableException_ChunkIsRetryable(t *testing.T) {
 			defer ts.Close()
 
 			provider := newTestProviderWithServer(t, ts)
-			req := testResponsesRequest()
-			req.Model = testConverseStreamModel
-			streamChan, bifrostErr := provider.ResponsesStream(testBedrockCtx(), noopPostHookRunner, nil, testBedrockKey(), req)
+			streamChan, bifrostErr := provider.ResponsesStream(testBedrockCtx(), noopPostHookRunner, nil, testBedrockKey(), testResponsesRequest())
 			assertRetryableExceptionChunk(t, streamChan, bifrostErr, tc.excType, tc.expectedStatus)
 		})
 	}
@@ -561,7 +547,7 @@ func generateTestCACert(t *testing.T) string {
 func TestBedrockTransportHTTP2Config(t *testing.T) {
 	config := &schemas.ProviderConfig{
 		NetworkConfig: schemas.NetworkConfig{
-			DefaultRequestTimeoutInSeconds: 300,
+			DefaultRequestTimeoutInSeconds: 30,
 			MaxConnsPerHost:                5000,
 			EnforceHTTP2:                   true,
 		},
@@ -579,50 +565,12 @@ func TestBedrockTransportHTTP2Config(t *testing.T) {
 	assert.Equal(t, schemas.DefaultMaxIdleConnsPerHost, transport.MaxIdleConnsPerHost)
 	assert.Equal(t, schemas.DefaultMaxIdleConnsPerHost, transport.MaxIdleConns)
 	assert.True(t, transport.ForceAttemptHTTP2)
-	assert.Nil(t, transport.HTTP2, "ping keepalive must stay off when the interval is unset")
-}
-
-func TestBedrockTransportHTTP2PingKeepalive(t *testing.T) {
-	newTransport := func(t *testing.T, enforceHTTP2 bool, pingIntervalSeconds int) *http.Transport {
-		t.Helper()
-		config := &schemas.ProviderConfig{
-			NetworkConfig: schemas.NetworkConfig{
-				DefaultRequestTimeoutInSeconds: 300,
-				EnforceHTTP2:                   enforceHTTP2,
-				HTTP2PingIntervalInSeconds:     pingIntervalSeconds,
-			},
-		}
-		config.CheckAndSetDefaults()
-
-		provider, err := NewBedrockProvider(config, noopLogger{})
-		require.NoError(t, err)
-
-		transport, ok := provider.client.Transport.(*http.Transport)
-		require.True(t, ok, "transport should be *http.Transport")
-		return transport
-	}
-
-	t.Run("enforced with a positive interval configures the PING keepalive", func(t *testing.T) {
-		transport := newTransport(t, true, 45)
-		require.NotNil(t, transport.HTTP2, "enforce_http2 + positive interval must set transport.HTTP2")
-		assert.Equal(t, 45*time.Second, transport.HTTP2.SendPingTimeout)
-	})
-
-	t.Run("enforced with a zero interval leaves the keepalive off", func(t *testing.T) {
-		transport := newTransport(t, true, 0)
-		assert.Nil(t, transport.HTTP2, "enforce_http2 alone must not imply pinging")
-	})
-
-	t.Run("non-enforced with a positive interval leaves the keepalive off", func(t *testing.T) {
-		transport := newTransport(t, false, 45)
-		assert.Nil(t, transport.HTTP2, "a ping interval without enforce_http2 must be a no-op")
-	})
 }
 
 func TestBedrockTransportCustomMaxConns(t *testing.T) {
 	config := &schemas.ProviderConfig{
 		NetworkConfig: schemas.NetworkConfig{
-			DefaultRequestTimeoutInSeconds: 300,
+			DefaultRequestTimeoutInSeconds: 30,
 			MaxConnsPerHost:                50,
 		},
 	}
@@ -642,7 +590,7 @@ func TestBedrockTransportCustomMaxConns(t *testing.T) {
 func TestBedrockTransportDefaultMaxConns(t *testing.T) {
 	config := &schemas.ProviderConfig{
 		NetworkConfig: schemas.NetworkConfig{
-			DefaultRequestTimeoutInSeconds: 300,
+			DefaultRequestTimeoutInSeconds: 30,
 			// MaxConnsPerHost left as 0 — should default to 5000
 		},
 	}
@@ -664,7 +612,7 @@ func TestBedrockTransportDefaultMaxConns(t *testing.T) {
 func TestBedrockTransportTLSInsecureSkipVerify(t *testing.T) {
 	config := &schemas.ProviderConfig{
 		NetworkConfig: schemas.NetworkConfig{
-			DefaultRequestTimeoutInSeconds: 300,
+			DefaultRequestTimeoutInSeconds: 30,
 			InsecureSkipVerify:             true,
 			EnforceHTTP2:                   true,
 		},
@@ -688,8 +636,8 @@ func TestBedrockTransportTLSCACert(t *testing.T) {
 
 	config := &schemas.ProviderConfig{
 		NetworkConfig: schemas.NetworkConfig{
-			DefaultRequestTimeoutInSeconds: 300,
-			CACertPEM:                      schemas.NewSecretVar(testCACert),
+			DefaultRequestTimeoutInSeconds: 30,
+			CACertPEM:                      schemas.NewEnvVar(testCACert),
 			EnforceHTTP2:                   true,
 		},
 	}
@@ -709,7 +657,7 @@ func TestBedrockTransportTLSCACert(t *testing.T) {
 func TestBedrockTransportDefaultTLS(t *testing.T) {
 	config := &schemas.ProviderConfig{
 		NetworkConfig: schemas.NetworkConfig{
-			DefaultRequestTimeoutInSeconds: 300,
+			DefaultRequestTimeoutInSeconds: 30,
 			// No TLS settings — should use system defaults
 		},
 	}
@@ -729,7 +677,7 @@ func TestBedrockTransportDefaultTLS(t *testing.T) {
 func TestBedrockTransportEnforceHTTP2(t *testing.T) {
 	config := &schemas.ProviderConfig{
 		NetworkConfig: schemas.NetworkConfig{
-			DefaultRequestTimeoutInSeconds: 300,
+			DefaultRequestTimeoutInSeconds: 30,
 			EnforceHTTP2:                   true,
 		},
 	}
@@ -748,7 +696,7 @@ func TestBedrockTransportEnforceHTTP2(t *testing.T) {
 func TestBedrockTransportEnforceHTTP2Disabled(t *testing.T) {
 	config := &schemas.ProviderConfig{
 		NetworkConfig: schemas.NetworkConfig{
-			DefaultRequestTimeoutInSeconds: 300,
+			DefaultRequestTimeoutInSeconds: 30,
 			EnforceHTTP2:                   false,
 		},
 	}
@@ -763,88 +711,4 @@ func TestBedrockTransportEnforceHTTP2Disabled(t *testing.T) {
 	// TLSNextProto must be set to empty map to truly disable HTTP/2 ALPN negotiation
 	assert.NotNil(t, transport.TLSNextProto)
 	assert.Empty(t, transport.TLSNextProto)
-}
-
-// TestSignAWSRequest_ExcludesVolatileHeadersFromSignature locks in the fix for the
-// "signature we calculated does not match" 403s on Bedrock. The AWS SDK signs every header
-// left on the request, so client/proxy headers forwarded from the /anthropic integration
-// ended up in SignedHeaders. Any hop that rewrites one of them (x-forwarded-for gains the
-// NAT address in transit) then invalidates the signature. AWS's signing guide requires only
-// host and x-amz-*, and explicitly warns against signing headers "mutated by proxies, load
-// balancers, and the nodes in a distributed system". Volatile headers are lifted out for
-// signing and restored afterwards; only Bifrost-internal x-bf-* is dropped for good.
-func TestSignAWSRequest_ExcludesVolatileHeadersFromSignature(t *testing.T) {
-	volatile := map[string]string{
-		"x-forwarded-for":   "10.30.10.147",
-		"x-forwarded-proto": "https",
-		"x-real-ip":         "10.30.10.147",
-		"x-request-id":      "57bac1b7-1831-4a0a-97cb-af8e87329147",
-		"x-bf-vk":           "sk-bf-secret-should-never-reach-aws",
-		"connection":        "keep-alive",
-	}
-	kept := map[string]string{
-		"anthropic-beta":  "interleaved-thinking-2025-05-14",
-		"accept-encoding": "identity", // deliberately set for eventstream TTFB (#4542)
-		"x-amz-target":    "converse",
-	}
-
-	req, err := http.NewRequest(http.MethodPost, "https://bedrock-runtime.us-east-1.amazonaws.com/model/m/converse-stream", strings.NewReader(`{"a":1}`))
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	for k, v := range volatile {
-		req.Header.Set(k, v)
-	}
-	for k, v := range kept {
-		req.Header.Set(k, v)
-	}
-
-	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
-	keyCfg := &schemas.BedrockKeyConfig{
-		AccessKey: *schemas.NewSecretVar("AKIAIOSFODNN7EXAMPLE"),
-		SecretKey: *schemas.NewSecretVar("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
-	}
-	if bifrostErr := signAWSRequest(ctx, req, keyCfg, "us-east-1", bedrockSigningService); bifrostErr != nil {
-		t.Fatalf("signAWSRequest failed: %s", bifrostErr.Error.Message)
-	}
-
-	auth := req.Header.Get("Authorization")
-	_, signedPart, found := strings.Cut(auth, "SignedHeaders=")
-	if !found {
-		t.Fatalf("no SignedHeaders in Authorization: %q", auth)
-	}
-	signedHeadersStr, _, _ := strings.Cut(signedPart, ",")
-	signedHeaders := strings.Split(signedHeadersStr, ";")
-
-	// None of the volatile headers may be covered by the signature.
-	for name := range volatile {
-		if slices.Contains(signedHeaders, name) {
-			t.Errorf("%q is in SignedHeaders (%q) — a proxy rewriting it breaks SigV4", name, signedHeadersStr)
-		}
-	}
-
-	// Bifrost-internal headers carry the caller's virtual key and must not reach AWS at all.
-	if got := req.Header.Get("x-bf-vk"); got != "" {
-		t.Errorf("x-bf-vk was forwarded upstream with value %q", got)
-	}
-
-	// Every other volatile header is restored after signing, so the wire is unchanged.
-	for name, want := range volatile {
-		if strings.HasPrefix(name, internalHeaderPrefix) {
-			continue
-		}
-		if got := req.Header.Get(name); got != want {
-			t.Errorf("%q should be restored after signing: got %q, want %q", name, got, want)
-		}
-	}
-
-	// Headers Bifrost controls must survive untouched and stay signed where required.
-	for name, want := range kept {
-		if got := req.Header.Get(name); got != want {
-			t.Errorf("%q should survive signing: got %q, want %q", name, got, want)
-		}
-	}
-	if !slices.Contains(signedHeaders, "host") {
-		t.Errorf("host must be signed; SignedHeaders=%q", signedHeadersStr)
-	}
 }

@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -215,15 +214,7 @@ func (m *ToolsManager) GetAvailableTools(ctx *schemas.BifrostContext) []schemas.
 	// Track tool names to prevent duplicates
 	seenToolNames := make(map[string]bool)
 
-	// Sort client names for deterministic tool ordering
-	sortedClients := make([]string, 0, len(availableToolsPerClient))
-	for clientName := range availableToolsPerClient {
-		sortedClients = append(sortedClients, clientName)
-	}
-	slices.Sort(sortedClients)
-
-	for _, clientName := range sortedClients {
-		clientTools := availableToolsPerClient[clientName]
+	for clientName, clientTools := range availableToolsPerClient {
 		client := m.clientManager.GetClientByName(clientName)
 		if client == nil {
 			m.logger.Warn("%s Client %s not found, skipping", MCPLogPrefix, clientName)
@@ -683,21 +674,18 @@ func (m *ToolsManager) executeToolInternal(
 	sanitizedToolName := stripClientPrefix(toolName, executionConfig.Name)
 	originalMCPToolName := getOriginalToolName(sanitizedToolName, toolNameMapping)
 
-	// Create timeout context for tool execution.
-	// Per-server timeout (executionConfig.ToolExecutionTimeout) takes precedence over the global.
+	// Create timeout context for tool execution
 	toolExecutionTimeout := m.toolExecutionTimeout.Load().(time.Duration)
-	if executionConfig != nil && executionConfig.ToolExecutionTimeout > 0 {
-		toolExecutionTimeout = executionConfig.ToolExecutionTimeout
-	}
 	toolCtx, cancel := context.WithTimeout(ctx, toolExecutionTimeout)
 	defer cancel()
 
 	// The connection (shared persistent OR ephemeral per-call) is supplied by
 	// the caller via AcquireClientConn. Admin-level credentials live on the
-	// transport; per-request filtered context-extras are injected uniformly by the
-	// transport headerFunc (see createHTTPConnection/createSSEConnection), so no
-	// per-call Header is set here — that keeps ping/list_tools and tools/call on a
-	// single header path.
+	// transport; per-call request carries filtered context-extras only.
+	reqHeaders, err := m.credStore.RequestHeaders(ctx, executionConfig)
+	if err != nil {
+		return nil, "", "", err
+	}
 	callRequest := mcp.CallToolRequest{
 		Request: mcp.Request{
 			Method: string(mcp.MethodToolsCall),
@@ -706,29 +694,24 @@ func (m *ToolsManager) executeToolInternal(
 			Name:      originalMCPToolName,
 			Arguments: arguments,
 		},
+		Header: reqHeaders,
 	}
 
-	toolCallStart := time.Now()
 	toolResponse, callErr := clientConn.CallTool(toolCtx, callRequest)
-	schemas.AddUpstreamLatency(ctx, time.Since(toolCallStart))
 	if callErr != nil {
-		// Sentinel-wrapped so the gate can classify error.type (timeout vs tool_error).
+		// Check if it was a timeout error
 		if toolCtx.Err() == context.DeadlineExceeded {
-			return nil, "", "", fmt.Errorf("MCP tool call timed out after %v: %s: %w", toolExecutionTimeout, toolName, ErrMCPToolTimeout)
+			return nil, "", "", fmt.Errorf("MCP tool call timed out after %v: %s", toolExecutionTimeout, toolName)
 		}
 		m.logger.Error("%s Tool execution failed for %s via client %s: %v", MCPLogPrefix, toolName, executionConfig.Name, callErr)
-		return nil, "", "", fmt.Errorf("MCP tool call failed for %s: %v: %w", toolName, callErr, ErrMCPToolCallFailed)
+		return nil, "", "", fmt.Errorf("MCP tool call failed: %v", callErr)
 	}
 
 	// Extract text from MCP response
 	responseText := extractTextFromMCPResponse(toolResponse, toolName)
 
-	// Create tool response message. toolResponse.IsError is the server reporting a
-	// failed execution over a successful call, so it must reach the model as a
-	// failure rather than as ordinary result text. toolResponse is nil-checked for
-	// the same reason extractTextFromMCPResponse checks it above.
-	isToolError := toolResponse != nil && toolResponse.IsError
-	return createToolResponseMessage(*toolCall, responseText, isToolError), executionConfig.Name, sanitizedToolName, nil
+	// Create tool response message
+	return createToolResponseMessage(*toolCall, responseText), executionConfig.Name, sanitizedToolName, nil
 }
 
 // ExecuteAgentForChatRequest executes agent mode for a chat request, handling

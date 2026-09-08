@@ -217,8 +217,7 @@ func convertWords(words []ElevenlabsSpeechToTextWord) ([]schemas.TranscriptionWo
 		}
 
 		transcriptionWord := schemas.TranscriptionWord{
-			Word:    word.Text,
-			Speaker: word.SpeakerID,
+			Word: word.Text,
 		}
 
 		if word.Start != nil {

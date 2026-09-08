@@ -10,7 +10,6 @@ import (
 )
 
 func TestVLLM(t *testing.T) {
-	t.Skip("vLLM tests are disabled")
 	t.Parallel()
 	baseURL := strings.TrimSpace(os.Getenv("VLLM_BASE_URL"))
 	if baseURL == "" {

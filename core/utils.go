@@ -20,11 +20,6 @@ import (
 	"github.com/neria-cloud/meridian/core/schemas"
 )
 
-const (
-	ProviderAutoResolveErrorMessage = "could not auto resolve a provider for the request, please specify a provider explicitly"
-	ModelAutoResolveErrorMessage    = "could not auto resolve a model for the request, please specify a model explicitly"
-)
-
 // transientServerStatusCodes are upstream-side failures unrelated to the credential —
 // retried with the *same* key (a different credential gains nothing against a flaky
 // server). Distinct from perKeyFailureStatusCodes which trigger key rotation.
@@ -33,12 +28,6 @@ var transientServerStatusCodes = map[int]bool{
 	502: true, // Bad Gateway
 	503: true, // Service Unavailable
 	504: true, // Gateway Timeout
-	// 529 — Anthropic's overloaded_error ("The API is temporarily overloaded",
-	// docs.claude.com/en/api/errors), also surfaced by Bedrock Mantle's Claude
-	// endpoint. It reflects capacity across all callers rather than anything about
-	// this credential, so it retries on the same key instead of rotating: rotating
-	// would burn every key on a condition none of them can avoid.
-	529: true,
 }
 
 // perKeyFailureStatusCodes are failures bound to the specific key/account rather than
@@ -89,10 +78,8 @@ var dynamicallyConfigurableProviders = []schemas.ModelProvider{
 	schemas.Anthropic,
 	schemas.Azure,
 	schemas.Bedrock,
-	schemas.BedrockMantle,
 	schemas.Cerebras,
 	schemas.Cohere,
-	schemas.DeepSeek,
 	schemas.Elevenlabs,
 	schemas.Gemini,
 	schemas.Groq,
@@ -103,9 +90,7 @@ var dynamicallyConfigurableProviders = []schemas.ModelProvider{
 	schemas.OpenRouter,
 	schemas.Parasail,
 	schemas.Perplexity,
-	schemas.Sarvam,
 	schemas.Vertex,
-	schemas.Wafer,
 	schemas.XAI,
 }
 
@@ -132,11 +117,11 @@ func providerRequiresKey(customConfig *schemas.CustomProviderConfig) bool {
 // Some providers like Vertex and Bedrock have their credentials in additional key configs.
 // Ollama and SGL are keyless (API Key is optional) but use per-key server URLs.
 func CanProviderKeyValueBeEmpty(providerKey schemas.ModelProvider) bool {
-	return providerKey == schemas.Vertex || providerKey == schemas.Bedrock || providerKey == schemas.BedrockMantle || providerKey == schemas.VLLM || providerKey == schemas.Azure || providerKey == schemas.Ollama || providerKey == schemas.SGL
+	return providerKey == schemas.Vertex || providerKey == schemas.Bedrock || providerKey == schemas.VLLM || providerKey == schemas.Azure || providerKey == schemas.Ollama || providerKey == schemas.SGL
 }
 
 func isKeySkippingAllowed(providerKey schemas.ModelProvider) bool {
-	return providerKey != schemas.Azure && providerKey != schemas.Bedrock && providerKey != schemas.BedrockMantle && providerKey != schemas.Vertex
+	return providerKey != schemas.Azure && providerKey != schemas.Bedrock && providerKey != schemas.Vertex
 }
 
 // calculateBackoff implements exponential backoff with jitter for retry attempts.
@@ -157,10 +142,10 @@ func validateRequestAfterPreRequestHooks(req *schemas.BifrostRequest) *schemas.B
 	}
 	provider, model, _ := req.GetRequestFields()
 	if provider == "" {
-		return newBifrostErrorFromMsg(ProviderAutoResolveErrorMessage)
+		return newBifrostErrorFromMsg("could not auto resolve a provider for the request, please specify a provider explicitly")
 	}
 	if isModelRequired(req.RequestType) && model == "" {
-		return newBifrostErrorFromMsg(ModelAutoResolveErrorMessage)
+		return newBifrostErrorFromMsg("could not auto resolve a model for the request, please specify a model explicitly")
 	}
 	return nil
 }
@@ -180,11 +165,6 @@ func validateKey(providerKey schemas.ModelProvider, key *schemas.Key) error {
 		// BedrockKeyConfig is optional — an empty config is valid for IRSA / ambient credential auth.
 		if key.BedrockKeyConfig == nil {
 			key.BedrockKeyConfig = &schemas.BedrockKeyConfig{}
-		}
-	case schemas.BedrockMantle:
-		// BedrockMantleKeyConfig is optional — an empty config is valid for IRSA / ambient credential auth.
-		if key.BedrockMantleKeyConfig == nil {
-			key.BedrockMantleKeyConfig = &schemas.BedrockMantleKeyConfig{}
 		}
 	case schemas.Vertex:
 		if key.VertexKeyConfig == nil {
@@ -312,21 +292,6 @@ func newBifrostCtxDoneError(ctx *schemas.BifrostContext, stage string) *schemas.
 	}
 }
 
-// newBifrostQueueFullError creates a 503 BifrostError for requests dropped
-// because the provider queue is full and dropExcessRequests is enabled.
-func newBifrostQueueFullError() *schemas.BifrostError {
-	statusCode := 503
-	errorType := schemas.RequestDropped
-	return &schemas.BifrostError{
-		IsBifrostError: true,
-		StatusCode:     &statusCode,
-		Error: &schemas.ErrorField{
-			Type:    &errorType,
-			Message: "request dropped: queue is full",
-		},
-	}
-}
-
 // newBifrostMessageChan creates a channel that sends a bifrost response.
 // It is used to send a bifrost response to the client.
 func newBifrostMessageChan(message *schemas.BifrostResponse) chan *schemas.BifrostStreamChunk {
@@ -354,76 +319,7 @@ func clearCtxForFallback(ctx *schemas.BifrostContext) {
 	ctx.ClearValue(schemas.BifrostContextKeyChangeRequestType)
 	ctx.ClearValue(schemas.BifrostContextKeyAttemptTrail)
 	ctx.ClearValue(schemas.BifrostContextKeyStreamEndIndicator)
-	ctx.ClearValue(schemas.BifrostContextKeyConnectionClosed)
 	ctx.ClearValue(schemas.BifrostContextKeySupportsAssistantPrefill)
-}
-
-// ClearContextForInternalRequest clears context state that is specific to the
-// caller's original request, so a context derived from it can carry an
-// internal sub-request (e.g. a plugin generating an embedding for its own
-// use) that must behave like a fresh top-level request.
-//
-// Two categories are cleared:
-//
-//   - Key routing: key-selection state resolved for the caller's provider
-//     (governance key allow-list, pinned/direct keys, key-selection skip). An
-//     internal request typically targets a different provider, and when it
-//     skips the plugin pipeline this state is never re-resolved — inherited,
-//     it is applied against the wrong provider's key pool and rejects every
-//     key ("no keys found for provider").
-//   - Body transport: raw-body passthrough and large-payload/large-response
-//     streaming state, plus caller-forwarded extra headers and the caller's
-//     URL-path override. Inherited, these make providers send the caller's
-//     raw or streamed body instead of marshaling the internal request, route
-//     it to the caller's endpoint path instead of the internal request's own,
-//     and forward the caller's headers on a call the caller doesn't own.
-//
-// Deliberately not cleared: tracing/observability keys (the sub-request
-// should stay tied to the caller's trace) and
-// BifrostContextKeySkipPluginPipeline (whether the internal request runs the
-// plugin pipeline is the caller's decision).
-// virtualKeyHeader carries Bifrost's own virtual key. IsSensitiveHeader does not match it
-// (no api-key/authorization/secret substring, no -token suffix), so it would otherwise be
-// exported to traces verbatim.
-const virtualKeyHeader = "x-bf-vk"
-
-// extraHeaderSpanAttribute returns the span-attribute value for a caller-supplied header and
-// whether it should be exported at all. The virtual key is dropped outright; other
-// credential-bearing headers keep their key (presence is useful) with the value redacted.
-func extraHeaderSpanAttribute(name string, values []string) (any, bool) {
-	if name == "" || len(values) == 0 {
-		return nil, false
-	}
-	if strings.EqualFold(name, virtualKeyHeader) {
-		return nil, false
-	}
-	if schemas.IsSensitiveHeader(name) {
-		return schemas.RedactedAttrValue, true
-	}
-	if len(values) == 1 {
-		return values[0], true
-	}
-	return values, true
-}
-
-func ClearContextForInternalRequest(ctx *schemas.BifrostContext) {
-	// Key routing.
-	ctx.ClearValue(schemas.BifrostContextKeyGovernanceIncludeOnlyKeys)
-	ctx.ClearValue(schemas.BifrostContextKeyRoutingPinnedAPIKeyID)
-	ctx.ClearValue(schemas.BifrostContextKeyAPIKeyID)
-	ctx.ClearValue(schemas.BifrostContextKeyAPIKeyName)
-	ctx.ClearValue(schemas.BifrostContextKeyDirectKey)
-	ctx.ClearValue(schemas.BifrostContextKeySkipKeySelection)
-	// Body transport.
-	ctx.ClearValue(schemas.BifrostContextKeyUseRawRequestBody)
-	ctx.ClearValue(schemas.BifrostContextKeySendBackRawRequest)
-	ctx.ClearValue(schemas.BifrostContextKeySendBackRawResponse)
-	ctx.ClearValue(schemas.BifrostContextKeyPassthroughOverridesPresent)
-	ctx.ClearValue(schemas.BifrostContextKeyLargePayloadMode)
-	ctx.ClearValue(schemas.BifrostContextKeyLargeResponseMode)
-	ctx.ClearValue(schemas.BifrostContextKeyExtraHeaders)
-	ctx.ClearValue(schemas.BifrostContextKeyPassthroughHeaders)
-	ctx.ClearValue(schemas.BifrostContextKeyURLPath)
 }
 
 var supportedBaseProvidersSet = func() map[schemas.ModelProvider]struct{} {
@@ -457,7 +353,7 @@ func IsStandardProvider(providerKey schemas.ModelProvider) bool {
 
 // IsStreamRequestType returns true if the given request type is a stream request.
 func IsStreamRequestType(reqType schemas.RequestType) bool {
-	return reqType == schemas.TextCompletionStreamRequest || reqType == schemas.ChatCompletionStreamRequest || reqType == schemas.ResponsesStreamRequest || reqType == schemas.ResponsesRetrieveStreamRequest || reqType == schemas.SpeechStreamRequest || reqType == schemas.TranscriptionStreamRequest || reqType == schemas.ImageGenerationStreamRequest || reqType == schemas.ImageEditStreamRequest || reqType == schemas.PassthroughStreamRequest || reqType == schemas.WebSocketResponsesRequest || reqType == schemas.RealtimeRequest
+	return reqType == schemas.TextCompletionStreamRequest || reqType == schemas.ChatCompletionStreamRequest || reqType == schemas.ResponsesStreamRequest || reqType == schemas.SpeechStreamRequest || reqType == schemas.TranscriptionStreamRequest || reqType == schemas.ImageGenerationStreamRequest || reqType == schemas.ImageEditStreamRequest || reqType == schemas.PassthroughStreamRequest || reqType == schemas.WebSocketResponsesRequest || reqType == schemas.RealtimeRequest
 }
 
 func GetTracerFromContext(ctx *schemas.BifrostContext) (schemas.Tracer, string, error) {
@@ -512,16 +408,6 @@ func isModellessVideoRequestType(reqType schemas.RequestType) bool {
 // isPassthroughRequestType returns true if the given request type is a passthrough request.
 func isPassthroughRequestType(reqType schemas.RequestType) bool {
 	return reqType == schemas.PassthroughRequest || reqType == schemas.PassthroughStreamRequest
-}
-
-// isResponsesLifecycleRequestType returns true for OpenAI Responses API lifecycle HTTP verbs.
-func isResponsesLifecycleRequestType(reqType schemas.RequestType) bool {
-	switch reqType {
-	case schemas.ResponsesRetrieveRequest, schemas.ResponsesRetrieveStreamRequest, schemas.ResponsesDeleteRequest, schemas.ResponsesCancelRequest, schemas.ResponsesInputItemsRequest:
-		return true
-	default:
-		return false
-	}
 }
 
 // IsFinalChunk returns true if the given context is a final chunk.
@@ -627,19 +513,6 @@ func RedactSensitiveString(s string) string {
 	return s[:4] + "[REDACTED]" + s[len(s)-4:]
 }
 
-// externalURLDNSLookupTimeout bounds the DNS resolution in ValidateExternalURL. The
-// package-level net.LookupIP has no context/deadline of its own, so a hung or blackholed
-// resolver (rather than a fast refusal) can block the caller indefinitely -- this timeout
-// closes that gap regardless of the caller's own retry/timeout logic, since those only
-// bound the HTTP request that follows resolution, not resolution itself.
-const externalURLDNSLookupTimeout = 5 * time.Second
-
-// lookupIPAddr is a seam over (&net.Resolver{}).LookupIPAddr so tests can substitute a
-// resolver that blocks until its context is canceled, proving externalURLDNSLookupTimeout
-// actually cuts off an in-flight lookup rather than only a lookup whose context had
-// already expired before it started.
-var lookupIPAddr = (&net.Resolver{}).LookupIPAddr
-
 // ValidateExternalURL validates a URL for security concerns (SSRF protection).
 // When allowPrivateNetwork is true, RFC 1918 private IPs are permitted (for k8s/LAN deployments).
 // Link-local addresses (169.254.x.x, fe80::) are always blocked regardless of allowPrivateNetwork.
@@ -661,18 +534,10 @@ func ValidateExternalURL(urlStr string, allowPrivateNetwork bool) error {
 	if hostname == "" {
 		return fmt.Errorf("URL must have a hostname")
 	}
-	// Resolve hostname to IP addresses. Bounded via net.Resolver.LookupIPAddr (not the
-	// package-level net.LookupIP, which has no way to accept a deadline) so a stalled
-	// resolver fails fast instead of hanging the caller forever.
-	lookupCtx, cancel := context.WithTimeout(context.Background(), externalURLDNSLookupTimeout)
-	defer cancel()
-	addrs, err := lookupIPAddr(lookupCtx, hostname)
+	// Resolve hostname to IP addresses
+	ips, err := net.LookupIP(hostname)
 	if err != nil {
 		return fmt.Errorf("failed to resolve hostname: %w", err)
-	}
-	ips := make([]net.IP, len(addrs))
-	for i, addr := range addrs {
-		ips[i] = addr.IP
 	}
 	for _, ip := range ips {
 		if ip.IsLoopback() {

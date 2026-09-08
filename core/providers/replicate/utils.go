@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	providerUtils "github.com/neria-cloud/meridian/core/providers/utils"
 	schemas "github.com/neria-cloud/meridian/core/schemas"
@@ -107,27 +106,25 @@ func listenToReplicateStreamURL(
 	}
 
 	// Make request
-	startTime := time.Now()
-	err := providerUtils.DoStreamingRequest(ctx, client, req, resp)
-	latency := time.Since(startTime)
+	err := client.Do(req, resp)
 	fasthttp.ReleaseRequest(req)
 
 	if err != nil {
 		providerUtils.ReleaseStreamingResponse(ctx, resp)
 		if errors.Is(err, context.Canceled) {
-			return nil, nil, providerUtils.SetErrorLatency(&schemas.BifrostError{
+			return nil, nil, &schemas.BifrostError{
 				IsBifrostError: false,
 				Error: &schemas.ErrorField{
 					Type:    schemas.Ptr(schemas.RequestCancelled),
 					Message: schemas.ErrRequestCancelled,
 					Error:   err,
 				},
-			}, latency)
+			}
 		}
 		if errors.Is(err, fasthttp.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, nil, providerUtils.SetErrorLatency(providerUtils.NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, err), latency)
+			return nil, nil, providerUtils.NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, err)
 		}
-		return nil, nil, providerUtils.SetErrorLatency(providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, err), latency)
+		return nil, nil, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, err)
 	}
 
 	// Extract provider response headers before status check so error responses also forward them
@@ -138,7 +135,7 @@ func listenToReplicateStreamURL(
 	// Check for HTTP errors
 	if resp.StatusCode() != fasthttp.StatusOK {
 		defer providerUtils.ReleaseStreamingResponse(ctx, resp)
-		return nil, nil, providerUtils.SetErrorLatency(parseReplicateError(resp.Body(), resp.StatusCode()), latency)
+		return nil, nil, parseReplicateError(resp.Body(), resp.StatusCode())
 	}
 
 	return resp.BodyStream(), resp, nil
@@ -199,19 +196,6 @@ func buildPredictionURL(ctx *schemas.BifrostContext, baseURL, model string, cust
 	return baseURL + path
 }
 
-// Token-usage log patterns compiled once at package init (hot path — avoid per-call MustCompile).
-var (
-	inputTokenCountPattern      = regexp.MustCompile(`Input token count:\s*(\d+)`)
-	inputTextTokenCountPattern  = regexp.MustCompile(`Input text token count:\s*(\d+)`)
-	inputImageTokenCountPattern = regexp.MustCompile(`Input image token count:\s*(\d+)`)
-	outputTokenCountPattern     = regexp.MustCompile(`Output token count:\s*(\d+)`)
-	totalTokenCountPattern      = regexp.MustCompile(`Total token count:\s*(\d+)`)
-	simpleTokensPattern         = regexp.MustCompile(`Tokens:\s*(\d+)`)
-
-	// Preferred first: "Input token count" then "Input text token count"
-	inputTokenPatterns = []*regexp.Regexp{inputTokenCountPattern, inputTextTokenCountPattern}
-)
-
 // parseTokenUsageFromLogs extracts token counts from Replicate's logs field
 // Handles multiple log formats with varying levels of detail
 func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inputTokens, outputTokens, totalTokens int, found bool) {
@@ -225,8 +209,12 @@ func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inp
 	// Pattern 1: Detailed format with input/output breakdown
 	// "Input token count: 20"
 	// "Input text token count: 15"
-	for _, pattern := range inputTokenPatterns {
-		if matches := pattern.FindStringSubmatch(logText); len(matches) > 1 {
+	inputPatterns := []string{
+		`Input token count:\s*(\d+)`,
+		`Input text token count:\s*(\d+)`,
+	}
+	for _, pattern := range inputPatterns {
+		if matches := regexp.MustCompile(pattern).FindStringSubmatch(logText); len(matches) > 1 {
 			if val, err := strconv.Atoi(matches[1]); err == nil {
 				inputTokens = val
 				foundAny = true
@@ -236,7 +224,7 @@ func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inp
 	}
 
 	// "Input image token count: 0" (for image generation)
-	if matches := inputImageTokenCountPattern.FindStringSubmatch(logText); len(matches) > 1 {
+	if matches := regexp.MustCompile(`Input image token count:\s*(\d+)`).FindStringSubmatch(logText); len(matches) > 1 {
 		if val, err := strconv.Atoi(matches[1]); err == nil {
 			inputTokens += val // Add to text input tokens
 			foundAny = true
@@ -244,7 +232,7 @@ func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inp
 	}
 
 	// "Output token count: 28"
-	if matches := outputTokenCountPattern.FindStringSubmatch(logText); len(matches) > 1 {
+	if matches := regexp.MustCompile(`Output token count:\s*(\d+)`).FindStringSubmatch(logText); len(matches) > 1 {
 		if val, err := strconv.Atoi(matches[1]); err == nil {
 			outputTokens = val
 			foundAny = true
@@ -252,7 +240,7 @@ func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inp
 	}
 
 	// "Total token count: 48"
-	if matches := totalTokenCountPattern.FindStringSubmatch(logText); len(matches) > 1 {
+	if matches := regexp.MustCompile(`Total token count:\s*(\d+)`).FindStringSubmatch(logText); len(matches) > 1 {
 		if val, err := strconv.Atoi(matches[1]); err == nil {
 			totalTokens = val
 			foundAny = true
@@ -262,7 +250,7 @@ func parseTokenUsageFromLogs(logs *string, requestType schemas.RequestType) (inp
 	// Pattern 2: Simple "Tokens: X" format (ambiguous - need heuristic)
 	// Only use if detailed format not found
 	if !foundAny {
-		if matches := simpleTokensPattern.FindStringSubmatch(logText); len(matches) > 1 {
+		if matches := regexp.MustCompile(`Tokens:\s*(\d+)`).FindStringSubmatch(logText); len(matches) > 1 {
 			if val, err := strconv.Atoi(matches[1]); err == nil {
 				// Heuristic based on response type
 				switch requestType {

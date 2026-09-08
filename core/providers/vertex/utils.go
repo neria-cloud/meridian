@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/neria-cloud/meridian/core/providers/anthropic"
 	"github.com/neria-cloud/meridian/core/providers/gemini"
 	providerUtils "github.com/neria-cloud/meridian/core/providers/utils"
 	schemas "github.com/neria-cloud/meridian/core/schemas"
@@ -15,19 +16,9 @@ import (
 // span deployments across distinct GCP projects (e.g. Anthropic models in
 // one project, Gemini in another).
 func resolveVertexProjectID(ctx *schemas.BifrostContext, key schemas.Key) string {
-	if ra := schemas.GetResolvedAlias(ctx); ra != nil && ra.Config != nil {
-		// Shared top-level override (how project_id now arrives from JSON/UI).
-		if ra.Config.ProjectID != nil {
-			if v := ra.Config.ProjectID.GetValue(); v != "" {
-				return v
-			}
-		}
-		// Back-compat for Go-constructed VertexAliasCfg (e.g. tests); the JSON
-		// path always populates the top-level field above.
-		if ra.Config.VertexAliasCfg != nil && ra.Config.VertexAliasCfg.ProjectID != nil {
-			if v := ra.Config.VertexAliasCfg.ProjectID.GetValue(); v != "" {
-				return v
-			}
+	if ra := schemas.GetResolvedAlias(ctx); ra != nil && ra.Config != nil && ra.Config.VertexAliasCfg != nil && ra.Config.VertexAliasCfg.ProjectID != nil {
+		if v := ra.Config.VertexAliasCfg.ProjectID.GetValue(); v != "" {
+			return v
 		}
 	}
 	if key.VertexKeyConfig != nil {
@@ -68,17 +59,36 @@ func resolveVertexRegion(ctx *schemas.BifrostContext, key schemas.Key) string {
 	return ""
 }
 
-// resolveVertexForceSingleRegion reports whether Bifrost must use the configured
-// region as-is and skip promoting multi-region-only models to a multi-region pool
-// endpoint. Priority: per-alias VertexAliasCfg.ForceSingleRegion (when set) >
-// key-level VertexKeyConfig.ForceSingleRegion. Used by provisioned-throughput
-// customers who can serve multi-region-only models (e.g. Opus 4.7/4.8) from a
-// single region.
-func resolveVertexForceSingleRegion(ctx *schemas.BifrostContext, key schemas.Key) bool {
-	if ra := schemas.GetResolvedAlias(ctx); ra != nil && ra.Config != nil && ra.Config.VertexAliasCfg != nil && ra.Config.VertexAliasCfg.ForceSingleRegion != nil {
-		return *ra.Config.VertexAliasCfg.ForceSingleRegion
+// getRequestBodyForAnthropicResponses serializes a BifrostResponsesRequest into the Anthropic wire format for Vertex AI.
+// Compared to the native Anthropic path, it strips model/region fields, remaps tool versions, injects beta headers
+// into the request body (rather than HTTP headers), and pins the Anthropic API version to DefaultVertexAnthropicVersion.
+func getRequestBodyForAnthropicResponses(ctx *schemas.BifrostContext, request *schemas.BifrostResponsesRequest, deployment string, isStreaming bool, isCountTokens bool, betaHeaderOverrides map[string]bool, providerExtraHeaders map[string]string, shouldSendBackRawRequest bool, shouldSendBackRawResponse bool) ([]byte, *schemas.BifrostError) {
+	jsonBody, buildErr := anthropic.BuildAnthropicResponsesRequestBody(ctx, request, anthropic.AnthropicRequestBuildConfig{
+		Provider:                  schemas.Vertex,
+		Deployment:                deployment,
+		DeleteModelField:          true,
+		DeleteRegionField:         true,
+		IsStreaming:               isStreaming,
+		IsCountTokens:             isCountTokens,
+		AddAnthropicVersion:       true,
+		AnthropicVersion:          DefaultVertexAnthropicVersion,
+		StripCacheControlScope:    true,
+		RemapToolVersions:         true,
+		InjectBetaHeadersIntoBody: true,
+		BetaHeaderOverrides:       betaHeaderOverrides,
+		ProviderExtraHeaders:      providerExtraHeaders,
+		ValidateTools:             true,
+		ShouldSendBackRawRequest:  shouldSendBackRawRequest,
+		ShouldSendBackRawResponse: shouldSendBackRawResponse,
+	})
+	if buildErr != nil {
+		return nil, buildErr
 	}
-	return key.VertexKeyConfig != nil && key.VertexKeyConfig.ForceSingleRegion
+	stripped, err := anthropic.StripUnsupportedFieldsFromRawBody(jsonBody, schemas.Vertex, deployment)
+	if err != nil {
+		return nil, providerUtils.NewBifrostOperationError(err.Error(), nil)
+	}
+	return stripped, nil
 }
 
 // isVertexMultiRegionEndpoint reports whether the Vertex location uses Google's
@@ -111,10 +121,7 @@ func getVertexAPIHost(region string) string {
 // the corresponding multi-region pool endpoint — but only for US (us-*) and
 // Europe (europe-*) regions that have multi-region pools. Other regions
 // (asia-*, me-*, etc.) stay on the single-region host.
-//
-// When forceSingleRegion is set the promotion is skipped and the configured
-// single-region host is used as-is (e.g. provisioned-throughput deployments).
-func getVertexModelAwareAPIHost(region string, model string, forceSingleRegion bool, logger schemas.Logger) string {
+func getVertexModelAwareAPIHost(region string, model string) string {
 	if region == "global" {
 		return "aiplatform.googleapis.com"
 	}
@@ -125,16 +132,7 @@ func getVertexModelAwareAPIHost(region string, model string, forceSingleRegion b
 	// Single-region: promote to multi-region pool if the model requires it
 	// and the region belongs to a pool that supports multi-region.
 	if providerUtils.IsVertexMultiRegionOnlyModel(model) {
-		if forceSingleRegion {
-			if logger != nil {
-				logger.Debug("[vertex] force_single_region set: keeping requested region %q for multi-region-only model %q; skipping multi-region pool promotion", region, model)
-			}
-			return fmt.Sprintf("%s-aiplatform.googleapis.com", region)
-		}
 		if pool, ok := vertexRegionToPool(region); ok {
-			if logger != nil {
-				logger.Debug("[vertex] promoting multi-region-only model %q from region %q to multi-region pool %q (host aiplatform.%s.rep.googleapis.com)", model, region, pool, pool)
-			}
 			return fmt.Sprintf("aiplatform.%s.rep.googleapis.com", pool)
 		}
 	}
@@ -169,8 +167,8 @@ func getVertexAPIBaseURL(region string, apiVersion string) string {
 
 // getVertexModelAwareAPIBaseURL is like getVertexAPIBaseURL but uses model-aware
 // host selection for multi-region endpoints.
-func getVertexModelAwareAPIBaseURL(region string, apiVersion string, model string, forceSingleRegion bool, logger schemas.Logger) string {
-	return fmt.Sprintf("https://%s/%s", getVertexModelAwareAPIHost(region, model, forceSingleRegion, logger), apiVersion)
+func getVertexModelAwareAPIBaseURL(region string, apiVersion string, model string) string {
+	return fmt.Sprintf("https://%s/%s", getVertexModelAwareAPIHost(region, model), apiVersion)
 }
 
 func getVertexProjectLocationURL(region string, apiVersion string, projectID string) string {
@@ -186,22 +184,21 @@ func getVertexPublisherModelURL(region string, apiVersion string, projectID stri
 // inference endpoints that may need multi-region pool hosts.
 // When a single-region is promoted to multi-region, both the host AND the
 // locations/ path segment are updated to the pool region.
-func getVertexModelAwarePublisherModelURL(region string, apiVersion string, projectID string, publisher string, model string, method string, forceSingleRegion bool, logger schemas.Logger) string {
-	effectiveRegion := getVertexEffectiveRegion(region, model, forceSingleRegion)
-	baseURL := fmt.Sprintf("https://%s/%s", getVertexModelAwareAPIHost(region, model, forceSingleRegion, logger), apiVersion)
+func getVertexModelAwarePublisherModelURL(region string, apiVersion string, projectID string, publisher string, model string, method string) string {
+	effectiveRegion := getVertexEffectiveRegion(region, model)
+	baseURL := fmt.Sprintf("https://%s/%s", getVertexModelAwareAPIHost(region, model), apiVersion)
 	return fmt.Sprintf("%s/projects/%s/locations/%s/publishers/%s/models/%s%s", baseURL, projectID, effectiveRegion, publisher, model, method)
 }
 
 // getVertexEffectiveRegion returns the region to use in URL path segments.
 // For multi-region locations it returns the region as-is. For single-region
 // locations it returns the multi-region pool if the model is flagged, otherwise
-// the original region. When forceSingleRegion is set the region is returned
-// as-is (no pool promotion).
-func getVertexEffectiveRegion(region string, model string, forceSingleRegion bool) string {
+// the original region.
+func getVertexEffectiveRegion(region string, model string) string {
 	if isVertexMultiRegionEndpoint(region) || region == "global" {
 		return region
 	}
-	if !forceSingleRegion && providerUtils.IsVertexMultiRegionOnlyModel(model) {
+	if providerUtils.IsVertexMultiRegionOnlyModel(model) {
 		if pool, ok := vertexRegionToPool(region); ok {
 			return pool
 		}
@@ -244,7 +241,6 @@ var vertexFlexModels = []string{
 	"gemini-3.1-flash-lite",
 	"gemini-3.1-flash-image-preview",
 	"gemini-3.1-pro-preview",
-	"gemini-3.5-flash-lite",
 	"gemini-3-flash-preview",
 	"gemini-3-pro-image-preview",
 }

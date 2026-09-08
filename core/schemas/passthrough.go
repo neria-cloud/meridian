@@ -15,10 +15,9 @@ type BifrostPassthroughRequest struct {
 // functions — no new pricing logic is required.
 type BifrostPassthroughUsage struct {
 	// Text / chat / responses / embeddings
-	LLMUsage     *BifrostLLMUsage
-	ServiceTier  *BifrostServiceTier // "priority" | "flex" | nil (default)
-	Speed        *string             // "fast" | "standard" — speed actually served (Anthropic fast mode); drives fast-mode billing
-	InferenceGeo *string             // "us" | "global" — inference geography served (Anthropic data residency); drives the 1.1x US multiplier
+	LLMUsage    *BifrostLLMUsage
+	ServiceTier *BifrostServiceTier // "priority" | "flex" | nil (default)
+	Speed       *string             // "fast" | "standard" — speed actually served (Anthropic fast mode); drives fast-mode billing
 
 	// Image generation / edit / variation
 	ImageUsage   *ImageUsage

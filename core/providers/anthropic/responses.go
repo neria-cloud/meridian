@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"math"
 	"strings"
 	"sync"
@@ -20,8 +19,8 @@ import (
 
 // AnthropicResponsesStreamState tracks state during streaming conversion for responses API
 type AnthropicResponsesStreamState struct {
-	InputJSONBuffers  map[int]string                       // server/tool input_json buffers keyed by Anthropic content block index
-	InputJSONPurposes map[int]anthropicInputJSONBufferKind // classifies each buffered content block
+	ChunkIndex      *int   // index of the chunk in the stream (reused for computer AND web search)
+	AccumulatedJSON string // deltas of any event (reused for computer AND web search)
 
 	// Computer tool accumulation
 	ComputerToolID *string
@@ -30,33 +29,10 @@ type AnthropicResponsesStreamState struct {
 	WebSearchToolID      *string                // Tool ID of active web search
 	WebSearchOutputIndex *int                   // Output index for this search
 	WebSearchResult      *AnthropicContentBlock // Result block when it arrives
-	WebSearchQuery       *string                // Query captured from the (pre-populated) server_tool_use input
-	WebSearchCaller      *AnthropicToolCaller   // Programmatic-tool-calling caller, if the search was spawned from code execution
 
 	// Web fetch tool accumulation
-	WebFetchToolID      *string                // Tool ID of active web fetch
-	WebFetchOutputIndex *int                   // Output index for this fetch
-	WebFetchURL         *string                // URL captured from the server_tool_use input
-	WebFetchResult      *AnthropicContentBlock // Result block when it arrives
-
-	// Advisor tool accumulation
-	AdvisorToolID      *string                // Tool ID of active advisor call
-	AdvisorOutputIndex *int                   // Output index for this advisor call
-	AdvisorResult      *AnthropicContentBlock // advisor_tool_result block when it arrives
-
-	// Tool search (server-side tool_search) accumulation
-	ToolSearchToolID      *string                // server_tool_use ID of active tool_search
-	ToolSearchToolName    *string                // tool name (tool_search_tool_regex|bm25) — kept so the done item matches the added item
-	ToolSearchOutputIndex *int                   // Output index for this tool_search call
-	ToolSearchResult      *AnthropicContentBlock // tool_search_tool_result block (carries tool_references) when it arrives
-
-	// Code execution tool accumulation (bash / text_editor / python sub-tools)
-	CodeExecToolID      *string                     // server_tool_use id of the active code-execution call
-	CodeExecToolName    *string                     // sub-tool name (bash_code_execution, etc.)
-	CodeExecOutputIndex *int                        // Output index for this code-execution call
-	CodeExecResult      *AnthropicContentBlock      // *_code_execution_tool_result block when it arrives
-	CodeExecInput       string                      // verbatim server_tool_use input JSON, kept across nested PTC blocks
-	Container           *AnthropicResponseContainer // sandbox container from the final message_delta
+	WebFetchToolID      *string // Tool ID of active web fetch
+	WebFetchOutputIndex *int    // Output index for this fetch
 
 	// OpenAI Responses API mapping state
 	ContentIndexToOutputIndex map[int]int                       // Maps Anthropic content_index to OpenAI output_index
@@ -69,13 +45,11 @@ type AnthropicResponsesStreamState struct {
 	TextContentIndices        map[int]bool                      // Tracks which content indices are text blocks
 	ReasoningContentIndices   map[int]bool                      // Tracks which content indices are reasoning blocks
 	TextBuffers               map[int]*strings.Builder          // Maps output_index to accumulated text content for done events
-	ReasoningTextBuffers      map[int]*strings.Builder          // Maps output_index to accumulated reasoning text for done events
 	CompactionContentIndices  map[int]*schemas.CacheControl     // Tracks pending compaction blocks with their cache control
 	CurrentOutputIndex        int                               // Current output index counter
 	MessageID                 *string                           // Message ID from message_start
 	Model                     *string                           // Model name from message_start
 	StopReason                *string                           // Stop reason for the message
-	StopDetails               *schemas.ResponsesStopDetails     // Refusal stop_details (server-side fallback), carried to the final message_delta
 	CreatedAt                 int                               // Timestamp for created_at consistency
 	HasEmittedCreated         bool                              // Whether we've emitted response.created
 	HasEmittedInProgress      bool                              // Whether we've emitted response.in_progress
@@ -86,62 +60,10 @@ type AnthropicResponsesStreamState struct {
 	SeenRealToolCall          bool                              // True when any non-SO tool_use/server_tool_use/mcp_tool_use content block was started
 }
 
-type anthropicInputJSONBufferKind string
-
-const (
-	anthropicInputJSONBufferComputer   anthropicInputJSONBufferKind = "computer"
-	anthropicInputJSONBufferWebSearch  anthropicInputJSONBufferKind = "web_search"
-	anthropicInputJSONBufferWebFetch   anthropicInputJSONBufferKind = "web_fetch"
-	anthropicInputJSONBufferAdvisor    anthropicInputJSONBufferKind = "advisor"
-	anthropicInputJSONBufferCodeExec   anthropicInputJSONBufferKind = "code_exec"
-	anthropicInputJSONBufferToolSearch anthropicInputJSONBufferKind = "tool_search"
-)
-
-func (state *AnthropicResponsesStreamState) beginInputJSONBuffer(index *int, kind anthropicInputJSONBufferKind) {
-	if index == nil {
-		return
-	}
-	if state.InputJSONBuffers == nil {
-		state.InputJSONBuffers = make(map[int]string)
-	}
-	if state.InputJSONPurposes == nil {
-		state.InputJSONPurposes = make(map[int]anthropicInputJSONBufferKind)
-	}
-	state.InputJSONBuffers[*index] = ""
-	state.InputJSONPurposes[*index] = kind
-}
-
-func (state *AnthropicResponsesStreamState) appendInputJSON(index *int, partial string) bool {
-	if index == nil || state.InputJSONPurposes == nil {
-		return false
-	}
-	if _, ok := state.InputJSONPurposes[*index]; !ok {
-		return false
-	}
-	state.InputJSONBuffers[*index] += partial
-	return true
-}
-
-func (state *AnthropicResponsesStreamState) finishInputJSONBuffer(index *int) (string, anthropicInputJSONBufferKind, bool) {
-	if index == nil || state.InputJSONPurposes == nil {
-		return "", "", false
-	}
-	kind, ok := state.InputJSONPurposes[*index]
-	if !ok {
-		return "", "", false
-	}
-	input := state.InputJSONBuffers[*index]
-	delete(state.InputJSONBuffers, *index)
-	delete(state.InputJSONPurposes, *index)
-	return input, kind, true
-}
-
 // anthropicResponsesStreamStatePool provides a pool for Anthropic responses stream state objects.
 var anthropicResponsesStreamStatePool = sync.Pool{
 	New: func() interface{} {
 		return &AnthropicResponsesStreamState{
-			InputJSONBuffers:          make(map[int]string),
-			InputJSONPurposes:         make(map[int]anthropicInputJSONBufferKind),
 			ContentIndexToOutputIndex: make(map[int]int),
 			ToolArgumentBuffers:       make(map[int]string),
 			MCPCallOutputIndices:      make(map[int]bool),
@@ -152,7 +74,6 @@ var anthropicResponsesStreamStatePool = sync.Pool{
 			CompactionContentIndices:  make(map[int]*schemas.CacheControl),
 			OutputItems:               make(map[int]*schemas.ResponsesMessage),
 			TextBuffers:               make(map[int]*strings.Builder),
-			ReasoningTextBuffers:      make(map[int]*strings.Builder),
 			CurrentOutputIndex:        0,
 			CreatedAt:                 int(time.Now().Unix()),
 			HasEmittedCreated:         false,
@@ -167,196 +88,6 @@ type anthropicToResponsesStreamState struct {
 	// webSearchItemIDs tracks item IDs for WebSearch tools so their argument deltas
 	// can be skipped and regenerated synthetically (with sanitization) at output_item.done.
 	webSearchItemIDs map[string]bool
-
-	// Anthropic content-block index allocation. OpenAI numbers output items while
-	// Anthropic numbers content blocks, and one web_search / code_execution call
-	// expands to two Anthropic blocks (server_tool_use + *_tool_result) — so the
-	// counts differ and the OpenAI indices cannot be reused 1:1 (they collide on
-	// programmatic tool calling). Each output item allocates its primary block index
-	// at output_item.added; deltas/stops look it up; the second (result) block gets
-	// a fresh index.
-	nextBlockIndex   int
-	blockIndexByItem map[string]int
-
-	// blockIndexMisses records non-empty item keys for which blockIndexFor was
-	// asked for an index that allocBlockIndex never assigned — i.e. a
-	// content_block_stop/_delta referencing a block whose content_block_start was
-	// never registered at output_item.added. This must not happen: every
-	// output_item.added allocates its block index (~L2053), and the Anthropic
-	// passthrough path routes every output_item.added through this converter so the
-	// allocator always runs (see mustConvertInPassthrough in the transport). A miss
-	// therefore signals a stream-bookkeeping desync; it is recorded so tests fail
-	// loudly instead of the stream silently mis-numbering blocks.
-	blockIndexMisses []string
-
-	// passthrough is true when this reverse conversion runs on the Claude Code
-	// passthrough path, where verbatim raw upstream frames are interleaved with the
-	// converter's own. Only then must the converter consume a content-block index for
-	// server-tool result blocks it still collapses (currently resultless web_search)
-	// to stay in lockstep with the upstream indices carried by interleaved raw frames.
-	// On the all-normalized path (OpenAI-via-Anthropic, curl), every frame is
-	// converter-built, so consuming the index would skip a number.
-	passthrough bool
-
-	// codeExecToolNameByItem remembers each code_interpreter_call's Anthropic
-	// sub-tool name (captured at output_item.added) so the code block's input can be
-	// reconstructed and closed on code.done — emitted before the nested web_search
-	// blocks, matching Anthropic's sequential ordering. The *_tool_result block then
-	// follows at output_item.done.
-	codeExecToolNameByItem map[string]string
-
-	// blockTypes records the content-block type each emitted content_block_start
-	// opened, indexed by the block index itself, and cleared to "" by its
-	// content_block_stop. Anthropic clients reject a content_block_delta whose kind
-	// does not match the block it lands on -- Claude Code aborts the whole turn with
-	// "Content block is not a thinking block" / "... is not a input_json block" --
-	// and the converter previously had no way to know what it had opened, so every
-	// delta emitter wrote blind. enforceStreamBlockTypes consults this on the way
-	// out; the reasoning branch of output_item.done also reads it to tell an item it
-	// opened as thinking from one it already emitted as redacted_thinking.
-	//
-	// A slice rather than a map: indices come from allocBlockIndex, a monotonic
-	// counter from zero, so they are dense and small (a handful per turn). That
-	// makes this one lazily grown backing array of string headers holding shared
-	// constants -- no hashing, no per-entry allocation, and no second map alongside
-	// blockIndexByItem.
-	blockTypes []AnthropicContentBlockType
-
-	// codeExecServerClosedByItem marks code_interpreter_call items whose
-	// server_tool_use block was already closed early on code.done (python/bash,
-	// where the input reconstructs from the neutral Code and the block must close
-	// before nested web_search blocks). text_editor has a multi-key input that
-	// Code can't carry and never spawns nested blocks, so it is left open here and
-	// closed at output_item.done from the verbatim carry input instead.
-	codeExecServerClosedByItem map[string]bool
-}
-
-// allocBlockIndex assigns and returns the next Anthropic content-block index. A
-// non-empty key is remembered so the block's later delta/stop events resolve to the
-// same index via blockIndexFor.
-func (s *anthropicToResponsesStreamState) allocBlockIndex(key string) *int {
-	idx := s.nextBlockIndex
-	s.nextBlockIndex++
-	if key != "" {
-		if s.blockIndexByItem == nil {
-			s.blockIndexByItem = make(map[string]int)
-		}
-		s.blockIndexByItem[key] = idx
-	}
-	return &idx
-}
-
-// blockIndexFor returns the index previously allocated for key. A non-empty key
-// that was never registered by allocBlockIndex means a stop/delta references a
-// block whose start we never emitted — a bookkeeping desync — so it is recorded
-// in blockIndexMisses before falling back to a fresh allocation (defensive — keeps
-// start/stop paired rather than crashing the stream).
-func (s *anthropicToResponsesStreamState) blockIndexFor(key string) *int {
-	if key != "" && s.blockIndexByItem != nil {
-		if idx, ok := s.blockIndexByItem[key]; ok {
-			return &idx
-		}
-	}
-	if key != "" {
-		s.blockIndexMisses = append(s.blockIndexMisses, key)
-	}
-	return s.allocBlockIndex(key)
-}
-
-// setBlockType records (or clears, with an empty blockType) the content-block type
-// open at index, growing the backing array only as far as the indices actually used.
-func (s *anthropicToResponsesStreamState) setBlockType(index int, blockType AnthropicContentBlockType) {
-	if index < 0 {
-		return
-	}
-	for len(s.blockTypes) <= index {
-		s.blockTypes = append(s.blockTypes, "")
-	}
-	s.blockTypes[index] = blockType
-}
-
-// blockType returns the content-block type currently open at index, or "" when no
-// block is open there.
-func (s *anthropicToResponsesStreamState) blockType(index int) AnthropicContentBlockType {
-	if index < 0 || index >= len(s.blockTypes) {
-		return ""
-	}
-	return s.blockTypes[index]
-}
-
-// reasoningPayloadAndSummary reports a reasoning item's encrypted payload (empty
-// when it carries none) and whether it holds any visible summary text. Together
-// these decide whether the item is redacted-only -- an atomic redacted_thinking
-// block -- or has visible reasoning that must stream into a thinking block.
-func reasoningPayloadAndSummary(item *schemas.ResponsesMessage) (string, bool) {
-	if item == nil || item.ResponsesReasoning == nil {
-		return "", false
-	}
-	encrypted := ""
-	if item.ResponsesReasoning.EncryptedContent != nil {
-		encrypted = *item.ResponsesReasoning.EncryptedContent
-	}
-	return encrypted, len(item.ResponsesReasoning.Summary) > 0
-}
-
-// isReasoningItem reports whether a stream item must be converted as reasoning.
-// The declared type alone is not enough: providers mislabel reasoning as a function
-// call when thinking is enabled, so an item typed as a function call that carries a
-// ResponsesReasoning payload is reasoning too. The block-type decision at
-// output_item.added and the encrypted-payload split at output_item.done both consult
-// this, because disagreeing is what left the misclassified path opening
-// redacted_thinking for summary-bearing items after the reasoning path was fixed.
-func isReasoningItem(item *schemas.ResponsesMessage) bool {
-	if item == nil || item.Type == nil {
-		return false
-	}
-	if *item.Type == schemas.ResponsesMessageTypeReasoning {
-		return true
-	}
-	return *item.Type == schemas.ResponsesMessageTypeFunctionCall && item.ResponsesReasoning != nil
-}
-
-// blockAcceptsDeltaType reports whether an Anthropic content block of blockType may
-// receive a delta of deltaType. It mirrors the validation Anthropic clients apply
-// while assembling a stream; a mismatch is not a cosmetic wire defect but a hard
-// client-side abort of the turn. Types the client does not switch on are permitted
-// so this never suppresses a frame it has no opinion about.
-func blockAcceptsDeltaType(blockType AnthropicContentBlockType, deltaType AnthropicStreamDeltaType) bool {
-	switch deltaType {
-	case AnthropicStreamDeltaTypeSignature:
-		// redacted_thinking is deliberately excluded: it is the one case the client
-		// throws on rather than tolerating.
-		return blockType == AnthropicContentBlockTypeThinking
-	case AnthropicStreamDeltaTypeThinking:
-		return blockType == AnthropicContentBlockTypeThinking ||
-			blockType == AnthropicContentBlockTypeRedactedThinking
-	case AnthropicStreamDeltaTypeText:
-		return blockType == AnthropicContentBlockTypeText
-	case AnthropicStreamDeltaTypeInputJSON:
-		return blockType == AnthropicContentBlockTypeToolUse ||
-			blockType == AnthropicContentBlockTypeServerToolUse ||
-			blockType == AnthropicContentBlockTypeMCPToolUse
-	default:
-		return true
-	}
-}
-
-// reverseStreamItemKey derives a stable per-item key for content-block index
-// allocation, consistent across output_item.added / delta / output_item.done.
-func reverseStreamItemKey(resp *schemas.BifrostResponsesStreamResponse) string {
-	if resp.Item != nil && resp.Item.ID != nil {
-		return *resp.Item.ID
-	}
-	if resp.ItemID != nil {
-		return *resp.ItemID
-	}
-	if resp.OutputIndex != nil {
-		return fmt.Sprintf("oi:%d", *resp.OutputIndex)
-	}
-	if resp.ContentIndex != nil {
-		return fmt.Sprintf("ci:%d", *resp.ContentIndex)
-	}
-	return ""
 }
 
 type anthropicToResponsesStreamStateKeyType struct{}
@@ -374,71 +105,8 @@ func getOrCreateAnthropicToResponsesStreamState(ctx *schemas.BifrostContext) *an
 	return state
 }
 
-type anthropicNativeEffortKeyType struct{}
-
-var anthropicNativeEffortKey = anthropicNativeEffortKeyType{}
-
-// anthropicNativeEffort records what an inbound Anthropic Messages request
-// actually said about output_config.effort and thinking, so the Anthropic egress
-// can rebuild both verbatim.
-//
-// The neutral ResponsesParametersReasoning cannot carry this on its own: it
-// documents Effort as "any value other than none will enable reasoning" (see
-// schemas/responses.go), so it can express "reason at effort X" and "reasoning
-// off", but not the two states an Anthropic caller can actually send --
-// "effort X, thinking left to the model's own default" and "effort X, thinking
-// explicitly disabled".
-//
-// That distinction is not cosmetic. Omitting `thinking` resolves to a per-model
-// default that differs across the family (Opus 5 and Sonnet 5 default it on;
-// Opus 4.6/4.7/4.8 and Sonnet 4.6 default it off), so collapsing "omitted" into
-// either concrete value flips behaviour on half the models, bills thinking tokens
-// the caller never asked for, and invalidates their cached prefix. Only the model
-// can resolve the absence correctly, so the absence is what gets forwarded.
-//
-// It rides on the context rather than ExtraParams because ExtraParams is
-// serialized onto the wire when the passthrough header is set: a Bifrost-internal
-// marker there would reach the upstream as an unknown field.
-type anthropicNativeEffort struct {
-	// Effort is the caller's output_config.effort, verbatim.
-	Effort string
-	// ThinkingOmitted is true when the caller sent no thinking parameter at all.
-	ThinkingOmitted bool
-}
-
-// setAnthropicNativeEffort records the inbound request's native effort intent.
-func setAnthropicNativeEffort(ctx *schemas.BifrostContext, effort string, thinkingOmitted bool) {
-	if ctx == nil {
-		return
-	}
-	ctx.SetValue(anthropicNativeEffortKey, anthropicNativeEffort{
-		Effort:          effort,
-		ThinkingOmitted: thinkingOmitted,
-	})
-}
-
-// anthropicNativeEffortFrom recovers the inbound request's native effort intent.
-// ok is false for any route that did not come in as an Anthropic Messages request
-// carrying output_config.effort, which is every OpenAI-shaped inbound dialect --
-// those keep the existing behaviour where an effort implies reasoning is on.
-func anthropicNativeEffortFrom(ctx *schemas.BifrostContext) (anthropicNativeEffort, bool) {
-	if ctx == nil {
-		return anthropicNativeEffort{}, false
-	}
-	native, ok := ctx.Value(anthropicNativeEffortKey).(anthropicNativeEffort)
-	return native, ok
-}
-
-// SetResponsesStreamPassthrough marks this request's Anthropic reverse stream
-// conversion as running on the Claude Code passthrough path (raw upstream frames
-// interleaved with converted ones). The converter reads state.passthrough only for
-// collapsed server-tool result blocks that must still consume an upstream index.
-func SetResponsesStreamPassthrough(ctx *schemas.BifrostContext) {
-	getOrCreateAnthropicToResponsesStreamState(ctx).passthrough = true
-}
-
-// AcquireAnthropicResponsesStreamState gets an Anthropic responses stream state from the pool.
-func AcquireAnthropicResponsesStreamState() *AnthropicResponsesStreamState {
+// acquireAnthropicResponsesStreamState gets an Anthropic responses stream state from the pool.
+func acquireAnthropicResponsesStreamState() *AnthropicResponsesStreamState {
 	state := anthropicResponsesStreamStatePool.Get().(*AnthropicResponsesStreamState)
 	// Clear maps (they're already initialized from New or previous flush)
 	// Only initialize if nil (shouldn't happen, but defensive)
@@ -446,16 +114,6 @@ func AcquireAnthropicResponsesStreamState() *AnthropicResponsesStreamState {
 		state.ContentIndexToOutputIndex = make(map[int]int)
 	} else {
 		clear(state.ContentIndexToOutputIndex)
-	}
-	if state.InputJSONBuffers == nil {
-		state.InputJSONBuffers = make(map[int]string)
-	} else {
-		clear(state.InputJSONBuffers)
-	}
-	if state.InputJSONPurposes == nil {
-		state.InputJSONPurposes = make(map[int]anthropicInputJSONBufferKind)
-	} else {
-		clear(state.InputJSONPurposes)
 	}
 	if state.ContentIndexToBlockType == nil {
 		state.ContentIndexToBlockType = make(map[int]AnthropicContentBlockType)
@@ -497,11 +155,6 @@ func AcquireAnthropicResponsesStreamState() *AnthropicResponsesStreamState {
 	} else {
 		clear(state.TextBuffers)
 	}
-	if state.ReasoningTextBuffers == nil {
-		state.ReasoningTextBuffers = make(map[int]*strings.Builder)
-	} else {
-		clear(state.ReasoningTextBuffers)
-	}
 	if state.CompactionContentIndices == nil {
 		state.CompactionContentIndices = make(map[int]*schemas.CacheControl)
 	} else {
@@ -513,33 +166,17 @@ func AcquireAnthropicResponsesStreamState() *AnthropicResponsesStreamState {
 		clear(state.OutputItems)
 	}
 	// Reset other fields
+	state.ChunkIndex = nil
+	state.AccumulatedJSON = ""
 	state.ComputerToolID = nil
 	state.WebSearchToolID = nil
 	state.WebSearchOutputIndex = nil
 	state.WebSearchResult = nil
-	state.WebSearchQuery = nil
-	state.WebSearchCaller = nil
 	state.WebFetchToolID = nil
 	state.WebFetchOutputIndex = nil
-	state.WebFetchURL = nil
-	state.WebFetchResult = nil
-	state.AdvisorToolID = nil
-	state.AdvisorOutputIndex = nil
-	state.AdvisorResult = nil
-	state.ToolSearchToolID = nil
-	state.ToolSearchToolName = nil
-	state.ToolSearchOutputIndex = nil
-	state.ToolSearchResult = nil
-	state.CodeExecToolID = nil
-	state.CodeExecToolName = nil
-	state.CodeExecOutputIndex = nil
-	state.CodeExecResult = nil
-	state.CodeExecInput = ""
-	state.Container = nil
 	state.CurrentOutputIndex = 0
 	state.MessageID = nil
 	state.StopReason = nil
-	state.StopDetails = nil
 	state.Model = nil
 	state.CreatedAt = int(time.Now().Unix())
 	state.HasEmittedCreated = false
@@ -552,8 +189,8 @@ func AcquireAnthropicResponsesStreamState() *AnthropicResponsesStreamState {
 	return state
 }
 
-// ReleaseAnthropicResponsesStreamState returns an Anthropic responses stream state to the pool.
-func ReleaseAnthropicResponsesStreamState(state *AnthropicResponsesStreamState) {
+// releaseAnthropicResponsesStreamState returns an Anthropic responses stream state to the pool.
+func releaseAnthropicResponsesStreamState(state *AnthropicResponsesStreamState) {
 	if state != nil {
 		state.flush() // Clean before returning to pool
 		anthropicResponsesStreamStatePool.Put(state)
@@ -562,31 +199,14 @@ func ReleaseAnthropicResponsesStreamState(state *AnthropicResponsesStreamState) 
 
 // flush resets the state of the stream state to its initial values
 func (state *AnthropicResponsesStreamState) flush() {
-	state.InputJSONBuffers = nil
-	state.InputJSONPurposes = nil
+	state.ChunkIndex = nil
+	state.AccumulatedJSON = ""
 	state.ComputerToolID = nil
 	state.WebSearchToolID = nil
 	state.WebSearchOutputIndex = nil
 	state.WebSearchResult = nil
-	state.WebSearchQuery = nil
-	state.WebSearchCaller = nil
 	state.WebFetchToolID = nil
 	state.WebFetchOutputIndex = nil
-	state.WebFetchURL = nil
-	state.WebFetchResult = nil
-	state.AdvisorToolID = nil
-	state.AdvisorOutputIndex = nil
-	state.AdvisorResult = nil
-	state.ToolSearchToolID = nil
-	state.ToolSearchToolName = nil
-	state.ToolSearchOutputIndex = nil
-	state.ToolSearchResult = nil
-	state.CodeExecToolID = nil
-	state.CodeExecToolName = nil
-	state.CodeExecOutputIndex = nil
-	state.CodeExecResult = nil
-	state.CodeExecInput = ""
-	state.Container = nil
 	state.ContentIndexToOutputIndex = nil
 	state.ContentIndexToBlockType = nil
 	state.ToolArgumentBuffers = nil
@@ -596,13 +216,11 @@ func (state *AnthropicResponsesStreamState) flush() {
 	state.TextContentIndices = nil
 	state.ReasoningContentIndices = nil
 	state.TextBuffers = nil
-	state.ReasoningTextBuffers = nil
 	state.CompactionContentIndices = nil
 	state.OutputItems = nil
 	state.CurrentOutputIndex = 0
 	state.MessageID = nil
 	state.StopReason = nil
-	state.StopDetails = nil
 	state.Model = nil
 	state.CreatedAt = int(time.Now().Unix())
 	state.HasEmittedCreated = false
@@ -621,15 +239,6 @@ func isCompactionItem(item *schemas.ResponsesMessage) bool {
 		*item.Type == schemas.ResponsesMessageTypeMessage &&
 		item.Content != nil && len(item.Content.ContentBlocks) > 0 &&
 		item.Content.ContentBlocks[0].Type == schemas.ResponsesOutputMessageContentTypeCompaction
-}
-
-// isFallbackItem checks if a ResponsesMessage represents a server-side fallback
-// boundary item (a message with a fallback content block as its first content block).
-func isFallbackItem(item *schemas.ResponsesMessage) bool {
-	return item != nil && item.Type != nil &&
-		*item.Type == schemas.ResponsesMessageTypeMessage &&
-		item.Content != nil && len(item.Content.ContentBlocks) > 0 &&
-		item.Content.ContentBlocks[0].Type == schemas.ResponsesOutputMessageContentTypeFallback
 }
 
 // getOrCreateOutputIndex returns the output index for a given content index, creating a new one if needed
@@ -677,10 +286,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 				}
 				if state.Model != nil {
 					response.Model = *state.Model
-				}
-				// Forward cache diagnostics from message_start (cache-diagnosis-2026-04-07).
-				if chunk.Message.Diagnostics != nil {
-					response.Diagnostics = chunk.Message.Diagnostics
 				}
 				// Forward input usage from message_start so clients see cache metrics early
 				if chunk.Message.Usage != nil {
@@ -736,15 +341,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 	case AnthropicStreamEventTypeContentBlockStart:
 		// Content block start - emit output_item.added (OpenAI-style)
 		if chunk.ContentBlock != nil && chunk.Index != nil {
-			// A data-less redacted_thinking block contributes nothing; skip it
-			// before reserving an output index so later items keep their
-			// positions in response.completed output.
-			if chunk.ContentBlock.Type == AnthropicContentBlockTypeRedactedThinking &&
-				(chunk.ContentBlock.Data == nil || *chunk.ContentBlock.Data == "") {
-				state.ContentIndexToBlockType[*chunk.Index] = AnthropicContentBlockTypeRedactedThinking
-				return nil, nil, false
-			}
-
 			outputIndex := state.getOrCreateOutputIndex(chunk.Index)
 
 			if chunk.ContentBlock.Type == AnthropicContentBlockTypeToolUse &&
@@ -755,7 +351,8 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 				state.SeenRealToolCall = true
 				// Start accumulating computer tool
 				state.ComputerToolID = chunk.ContentBlock.ID
-				state.beginInputJSONBuffer(chunk.Index, anthropicInputJSONBufferComputer)
+				state.ChunkIndex = chunk.Index
+				state.AccumulatedJSON = ""
 
 				// Emit output_item.added for computer_call
 				item := &schemas.ResponsesMessage{
@@ -782,43 +379,29 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 				chunk.ContentBlock.ID != nil {
 
 				state.SeenRealToolCall = true
-				// web_search server_tool_use usually arrives pre-populated (query in
-				// input, not streamed). Keep a buffer anyway so unusual input_json_delta
-				// events are swallowed and can be used as a fallback on block stop.
-				state.beginInputJSONBuffer(chunk.Index, anthropicInputJSONBufferWebSearch)
+				// Start accumulating web search query (reuse shared accumulation fields)
+				state.ChunkIndex = chunk.Index
+				state.AccumulatedJSON = ""
 				state.WebSearchToolID = chunk.ContentBlock.ID
+				// Store output index value (allocate new int to avoid pointer-to-local-variable issue)
 				state.WebSearchOutputIndex = schemas.Ptr(outputIndex)
-				state.WebSearchQuery = nil
-				if q := providerUtils.GetJSONField(chunk.ContentBlock.Input, "query"); q.Exists() && q.Type == gjson.String {
-					state.WebSearchQuery = schemas.Ptr(q.Str)
-				}
-				state.WebSearchCaller = chunk.ContentBlock.Caller
 
 				// Store item ID
 				state.ItemIDs[outputIndex] = *chunk.ContentBlock.ID
 
-				wsAction := &schemas.ResponsesWebSearchToolCallAction{Type: "search"}
-				if state.WebSearchQuery != nil {
-					wsAction.Query = state.WebSearchQuery
-					wsAction.Queries = []string{*state.WebSearchQuery}
-				}
-				toolMsg := &schemas.ResponsesToolMessage{
-					CallID: chunk.ContentBlock.ID,
-					Action: &schemas.ResponsesToolMessageActionStruct{ResponsesWebSearchToolCallAction: wsAction},
-				}
-				if state.WebSearchCaller != nil {
-					toolMsg.Caller = &schemas.ResponsesToolCaller{
-						Type:   string(state.WebSearchCaller.Type),
-						ToolID: state.WebSearchCaller.ToolID,
-					}
-				}
-
 				// Emit output_item.added for web_search_call
 				item := &schemas.ResponsesMessage{
-					ID:                   chunk.ContentBlock.ID,
-					Type:                 schemas.Ptr(schemas.ResponsesMessageTypeWebSearchCall),
-					Status:               schemas.Ptr("in_progress"),
-					ResponsesToolMessage: toolMsg,
+					ID:     chunk.ContentBlock.ID,
+					Type:   schemas.Ptr(schemas.ResponsesMessageTypeWebSearchCall),
+					Status: schemas.Ptr("in_progress"),
+					ResponsesToolMessage: &schemas.ResponsesToolMessage{
+						CallID: chunk.ContentBlock.ID,
+						Action: &schemas.ResponsesToolMessageActionStruct{
+							ResponsesWebSearchToolCallAction: &schemas.ResponsesWebSearchToolCallAction{
+								Type: "search",
+							},
+						},
+					},
 				}
 
 				var responses []*schemas.BifrostResponsesStreamResponse
@@ -883,68 +466,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 				return nil, nil, false
 			}
 
-			// Handle tool_search server_tool_use (server-side tool_search query block).
-			// Anthropic runs the search server-side and returns a tool_search_tool_result
-			// carrying tool_references to the discovered (deferred) tools; the model then
-			// emits a normal tool_use to call one. Mirrors the web_search query path.
-			if chunk.ContentBlock.Type == AnthropicContentBlockTypeServerToolUse &&
-				chunk.ContentBlock.Name != nil &&
-				(*chunk.ContentBlock.Name == string(AnthropicToolNameToolSearchRegex) ||
-					*chunk.ContentBlock.Name == string(AnthropicToolNameToolSearchBM25)) &&
-				chunk.ContentBlock.ID != nil {
-
-				state.SeenRealToolCall = true
-				// Suppress the query input_json deltas via the shared input-buffer path;
-				// the search is run server-side, so we only care about the result block.
-				state.beginInputJSONBuffer(chunk.Index, anthropicInputJSONBufferToolSearch)
-				state.ToolSearchToolID = chunk.ContentBlock.ID
-				state.ToolSearchToolName = chunk.ContentBlock.Name
-				state.ToolSearchOutputIndex = schemas.Ptr(outputIndex)
-				state.ItemIDs[outputIndex] = *chunk.ContentBlock.ID
-				// Mark block type so content_block_stop doesn't emit a generic message done
-				if chunk.Index != nil {
-					state.ContentIndexToBlockType[*chunk.Index] = AnthropicContentBlockTypeServerToolUse
-					state.TextContentIndices[*chunk.Index] = false
-				}
-
-				// Emit output_item.added for the tool_search_call (completed at result block-stop)
-				item := &schemas.ResponsesMessage{
-					ID:     chunk.ContentBlock.ID,
-					Type:   schemas.Ptr(schemas.ResponsesMessageTypeToolSearchCall),
-					Status: schemas.Ptr("in_progress"),
-					ResponsesToolMessage: &schemas.ResponsesToolMessage{
-						CallID: chunk.ContentBlock.ID,
-						Name:   chunk.ContentBlock.Name,
-					},
-				}
-				return []*schemas.BifrostResponsesStreamResponse{{
-					Type:           schemas.ResponsesStreamResponseTypeOutputItemAdded,
-					SequenceNumber: sequenceNumber,
-					OutputIndex:    schemas.Ptr(outputIndex),
-					ContentIndex:   chunk.Index,
-					Item:           item,
-				}}, nil, false
-			}
-
-			// Handle tool_search_tool_result block (the discovered tool_references arrive).
-			// Store it; the tool_search_call output_item.done (carrying tool_references) is
-			// emitted on this block's content_block_stop. Mirrors web_search_tool_result.
-			if chunk.ContentBlock.Type == AnthropicContentBlockTypeToolSearchToolResult &&
-				chunk.ContentBlock.ToolUseID != nil {
-
-				if chunk.Index != nil {
-					state.ContentIndexToBlockType[*chunk.Index] = AnthropicContentBlockTypeToolSearchToolResult
-				}
-
-				if state.ToolSearchToolID != nil && *state.ToolSearchToolID == *chunk.ContentBlock.ToolUseID {
-					// Store the result block (arrives complete with all tool_references)
-					state.ToolSearchResult = chunk.ContentBlock
-				}
-
-				// Defer the done to content_block_stop (don't drop the block)
-				return nil, nil, false
-			}
-
 			// Handle web_fetch server_tool_use (fetch block)
 			if chunk.ContentBlock.Type == AnthropicContentBlockTypeServerToolUse &&
 				chunk.ContentBlock.Name != nil &&
@@ -952,40 +473,20 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 				chunk.ContentBlock.ID != nil {
 
 				state.SeenRealToolCall = true
-				state.beginInputJSONBuffer(chunk.Index, anthropicInputJSONBufferWebFetch)
+				state.ChunkIndex = chunk.Index
+				state.AccumulatedJSON = ""
 				state.WebFetchToolID = chunk.ContentBlock.ID
 				state.WebFetchOutputIndex = schemas.Ptr(outputIndex)
-				state.WebFetchURL = nil
-				if u := providerUtils.GetJSONField(chunk.ContentBlock.Input, "url"); u.Exists() && u.Type == gjson.String {
-					state.WebFetchURL = schemas.Ptr(u.Str)
-				}
 
 				state.ItemIDs[outputIndex] = *chunk.ContentBlock.ID
 
-				toolMsg := &schemas.ResponsesToolMessage{
-					CallID: chunk.ContentBlock.ID,
-				}
-				if state.WebFetchURL != nil {
-					toolMsg.Action = &schemas.ResponsesToolMessageActionStruct{
-						ResponsesWebFetchToolCallAction: &schemas.ResponsesWebFetchToolCallAction{
-							Type: "fetch",
-							URL:  *state.WebFetchURL,
-						},
-					}
-				}
-				// Preserve the programmatic-tool-calling caller (set when this fetch was
-				// spawned from inside the code-execution sandbox), mirroring web_search.
-				if chunk.ContentBlock.Caller != nil {
-					toolMsg.Caller = &schemas.ResponsesToolCaller{
-						Type:   string(chunk.ContentBlock.Caller.Type),
-						ToolID: chunk.ContentBlock.Caller.ToolID,
-					}
-				}
 				item := &schemas.ResponsesMessage{
-					ID:                   chunk.ContentBlock.ID,
-					Type:                 schemas.Ptr(schemas.ResponsesMessageTypeWebFetchCall),
-					Status:               schemas.Ptr("in_progress"),
-					ResponsesToolMessage: toolMsg,
+					ID:     chunk.ContentBlock.ID,
+					Type:   schemas.Ptr(schemas.ResponsesMessageTypeWebFetchCall),
+					Status: schemas.Ptr("in_progress"),
+					ResponsesToolMessage: &schemas.ResponsesToolMessage{
+						CallID: chunk.ContentBlock.ID,
+					},
 				}
 
 				var responses []*schemas.BifrostResponsesStreamResponse
@@ -1028,12 +529,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 						delete(state.ContentIndexToBlockType, *chunk.Index)
 					}
 
-					// Remember that the result block arrived; its content is not
-					// represented in the Responses model (handled server-side), but its
-					// presence drives the web_fetch_call output_item.done at the result
-					// block's content_block_stop (mirrors web_search).
-					state.WebFetchResult = chunk.ContentBlock
-
 					return []*schemas.BifrostResponsesStreamResponse{{
 						Type:           schemas.ResponsesStreamResponseTypeWebFetchCallCompleted,
 						SequenceNumber: sequenceNumber,
@@ -1042,114 +537,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 					}}, nil, false
 				}
 
-				return nil, nil, false
-			}
-
-			// Handle advisor server_tool_use (the call; input is always empty).
-			// The paired advisor_tool_result is emitted as output_item.done when
-			// the result block's content_block_stop arrives (mirrors web_search).
-			if chunk.ContentBlock.Type == AnthropicContentBlockTypeServerToolUse &&
-				chunk.ContentBlock.Name != nil &&
-				*chunk.ContentBlock.Name == string(AnthropicToolNameAdvisor) &&
-				chunk.ContentBlock.ID != nil {
-
-				state.SeenRealToolCall = true
-				state.beginInputJSONBuffer(chunk.Index, anthropicInputJSONBufferAdvisor) // absorbs the empty advisor input_json_delta
-				state.AdvisorToolID = chunk.ContentBlock.ID
-				state.AdvisorOutputIndex = schemas.Ptr(outputIndex)
-				state.ItemIDs[outputIndex] = *chunk.ContentBlock.ID
-
-				item := &schemas.ResponsesMessage{
-					ID:     chunk.ContentBlock.ID,
-					Type:   schemas.Ptr(schemas.ResponsesMessageTypeAdvisorCall),
-					Status: schemas.Ptr("in_progress"),
-					ResponsesToolMessage: &schemas.ResponsesToolMessage{
-						CallID: chunk.ContentBlock.ID,
-						Name:   schemas.Ptr(string(AnthropicToolNameAdvisor)),
-					},
-				}
-
-				return []*schemas.BifrostResponsesStreamResponse{{
-					Type:           schemas.ResponsesStreamResponseTypeOutputItemAdded,
-					SequenceNumber: sequenceNumber,
-					OutputIndex:    schemas.Ptr(outputIndex),
-					ContentIndex:   chunk.Index,
-					Item:           item,
-				}}, nil, false
-			}
-
-			// Handle advisor_tool_result block (arrives complete in one event).
-			// Store it; the output_item.done is emitted on its content_block_stop.
-			if chunk.ContentBlock.Type == AnthropicContentBlockTypeAdvisorToolResult &&
-				chunk.ContentBlock.ToolUseID != nil {
-
-				if chunk.Index != nil {
-					state.ContentIndexToBlockType[*chunk.Index] = AnthropicContentBlockTypeAdvisorToolResult
-				}
-				if state.AdvisorToolID != nil && *state.AdvisorToolID == *chunk.ContentBlock.ToolUseID {
-					state.AdvisorResult = chunk.ContentBlock
-				}
-				return nil, nil, false
-			}
-
-			// Handle code-execution server_tool_use (bash / text_editor / python).
-			// The input JSON is accumulated; the decoded code is emitted on
-			// content_block_stop (Anthropic streams JSON, OpenAI streams raw code).
-			if chunk.ContentBlock.Type == AnthropicContentBlockTypeServerToolUse &&
-				chunk.ContentBlock.Name != nil &&
-				isAnthropicCodeExecutionToolName(*chunk.ContentBlock.Name) &&
-				chunk.ContentBlock.ID != nil {
-
-				state.SeenRealToolCall = true
-				state.beginInputJSONBuffer(chunk.Index, anthropicInputJSONBufferCodeExec)
-				state.CodeExecToolID = chunk.ContentBlock.ID
-				state.CodeExecToolName = chunk.ContentBlock.Name
-				state.CodeExecOutputIndex = schemas.Ptr(outputIndex)
-				state.ItemIDs[outputIndex] = *chunk.ContentBlock.ID
-
-				item := &schemas.ResponsesMessage{
-					ID:     chunk.ContentBlock.ID,
-					Type:   schemas.Ptr(schemas.ResponsesMessageTypeCodeInterpreterCall),
-					Status: schemas.Ptr("in_progress"),
-					ResponsesToolMessage: &schemas.ResponsesToolMessage{
-						CallID:                           chunk.ContentBlock.ID,
-						ResponsesCodeInterpreterToolCall: &schemas.ResponsesCodeInterpreterToolCall{},
-						// Carry the sub-tool name so the reverse converter can
-						// reconstruct the correct server_tool_use name at this start.
-						ResponsesCodeExecutionCall: &schemas.ResponsesCodeExecutionCall{ToolName: *chunk.ContentBlock.Name},
-					},
-				}
-
-				return []*schemas.BifrostResponsesStreamResponse{
-					{
-						Type:           schemas.ResponsesStreamResponseTypeOutputItemAdded,
-						SequenceNumber: sequenceNumber,
-						OutputIndex:    schemas.Ptr(outputIndex),
-						ContentIndex:   chunk.Index,
-						Item:           item,
-					},
-					{
-						Type:           schemas.ResponsesStreamResponseTypeCodeInterpreterCallInProgress,
-						SequenceNumber: sequenceNumber + 1,
-						OutputIndex:    schemas.Ptr(outputIndex),
-						ItemID:         chunk.ContentBlock.ID,
-					},
-				}, nil, false
-			}
-
-			// Handle code-execution result block (arrives complete in one event).
-			// Store it; the output_item.done is emitted on its content_block_stop.
-			if (chunk.ContentBlock.Type == AnthropicContentBlockTypeCodeExecutionToolResult ||
-				chunk.ContentBlock.Type == AnthropicContentBlockTypeBashCodeExecutionToolResult ||
-				chunk.ContentBlock.Type == AnthropicContentBlockTypeTextEditorCodeExecutionToolResult) &&
-				chunk.ContentBlock.ToolUseID != nil {
-
-				if chunk.Index != nil {
-					state.ContentIndexToBlockType[*chunk.Index] = chunk.ContentBlock.Type
-				}
-				if state.CodeExecToolID != nil && *state.CodeExecToolID == *chunk.ContentBlock.ToolUseID {
-					state.CodeExecResult = chunk.ContentBlock
-				}
 				return nil, nil, false
 			}
 
@@ -1169,55 +556,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 
 				// Don't emit output_item.added yet - wait for the delta with actual summary
 				return nil, nil, false
-			case AnthropicContentBlockTypeFallback:
-				// Fallback boundary marker - no deltas follow, so emit the complete
-				// item (added + done) here from the start event's from/to models.
-				itemID := fmt.Sprintf("fb_%d", outputIndex)
-				state.ItemIDs[outputIndex] = itemID
-				if chunk.Index != nil {
-					state.ContentIndexToBlockType[*chunk.Index] = AnthropicContentBlockTypeFallback
-				}
-				messageType := schemas.ResponsesMessageTypeMessage
-				fbRole := schemas.ResponsesInputMessageRoleAssistant
-				fallback := &schemas.ResponsesOutputMessageContentFallback{}
-				if chunk.ContentBlock.From != nil {
-					fallback.FromModel = chunk.ContentBlock.From.Model
-				}
-				if chunk.ContentBlock.To != nil {
-					fallback.ToModel = chunk.ContentBlock.To.Model
-				}
-				if chunk.ContentBlock.Trigger != nil {
-					fallback.TriggerType = chunk.ContentBlock.Trigger.Type
-					fallback.TriggerCategory = chunk.ContentBlock.Trigger.Category
-				}
-				item := &schemas.ResponsesMessage{
-					ID:     schemas.Ptr(itemID),
-					Status: schemas.Ptr("completed"),
-					Type:   &messageType,
-					Role:   &fbRole,
-					Content: &schemas.ResponsesMessageContent{
-						ContentBlocks: []schemas.ResponsesMessageContentBlock{{
-							Type:                                  schemas.ResponsesOutputMessageContentTypeFallback,
-							ResponsesOutputMessageContentFallback: fallback,
-						}},
-					},
-				}
-				return []*schemas.BifrostResponsesStreamResponse{
-					{
-						Type:           schemas.ResponsesStreamResponseTypeOutputItemAdded,
-						SequenceNumber: sequenceNumber,
-						OutputIndex:    schemas.Ptr(outputIndex),
-						ContentIndex:   chunk.Index,
-						Item:           item,
-					},
-					{
-						Type:           schemas.ResponsesStreamResponseTypeOutputItemDone,
-						SequenceNumber: sequenceNumber + 1,
-						OutputIndex:    schemas.Ptr(outputIndex),
-						ContentIndex:   chunk.Index,
-						Item:           item,
-					},
-				}, nil, false
 			case AnthropicContentBlockTypeText:
 				// Text block - emit output_item.added with type "message"
 				messageType := schemas.ResponsesMessageTypeMessage
@@ -1411,12 +749,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 					state.ReasoningContentIndices[*chunk.Index] = true
 				}
 
-				// Persist into OutputItems so content_block_stop can fold the
-				// accumulated text and signature into the matching output_item.done
-				// and response.completed carries the completed reasoning item.
-				itemCopy := *item
-				state.OutputItems[outputIndex] = &itemCopy
-
 				var responses []*schemas.BifrostResponsesStreamResponse
 
 				// Emit output_item.added
@@ -1448,48 +780,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 				})
 
 				return responses, nil, false
-			case AnthropicContentBlockTypeRedactedThinking:
-				// Redacted thinking blocks arrive complete in content_block_start (no
-				// deltas follow; data-less blocks were already skipped above, before
-				// an output index was reserved). Surface the encrypted payload as a
-				// reasoning item with encrypted_content, mirroring the non-streaming
-				// converter, so streaming clients can replay it on the next turn;
-				// Anthropic rejects tool-use follow-ups whose latest assistant
-				// message dropped it.
-				messageType := schemas.ResponsesMessageTypeReasoning
-				role := schemas.ResponsesInputMessageRoleAssistant
-
-				// Generate stable ID for the reasoning item
-				var itemID string
-				if state.MessageID == nil {
-					itemID = fmt.Sprintf("reasoning_%d", outputIndex)
-				} else {
-					itemID = fmt.Sprintf("msg_%s_reasoning_%d", *state.MessageID, outputIndex)
-				}
-				state.ItemIDs[outputIndex] = itemID
-
-				item := &schemas.ResponsesMessage{
-					ID:   &itemID,
-					Type: &messageType,
-					Role: &role,
-					ResponsesReasoning: &schemas.ResponsesReasoning{
-						Summary:          []schemas.ResponsesReasoningSummary{},
-						EncryptedContent: chunk.ContentBlock.Data,
-					},
-				}
-
-				// Persist into OutputItems so the block's content_block_stop emits the
-				// matching output_item.done and response.completed carries the item.
-				itemCopy := *item
-				state.OutputItems[outputIndex] = &itemCopy
-
-				return []*schemas.BifrostResponsesStreamResponse{{
-					Type:           schemas.ResponsesStreamResponseTypeOutputItemAdded,
-					SequenceNumber: sequenceNumber,
-					OutputIndex:    schemas.Ptr(outputIndex),
-					ContentIndex:   chunk.Index,
-					Item:           item,
-				}}, nil, false
 			default:
 				// Send down an empty response only when integration type is anthropic
 				if ctx.Value(schemas.BifrostContextKeyIntegrationType) == "anthropic" {
@@ -1580,7 +870,11 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 			case AnthropicStreamDeltaTypeInputJSON:
 				// Function call arguments delta
 				if chunk.Delta.PartialJSON != nil {
-					if state.appendInputJSON(chunk.Index, *chunk.Delta.PartialJSON) {
+					// Check if we're accumulating any tool (computer or web search)
+					// Both use the shared ChunkIndex and AccumulatedJSON fields
+					if state.ChunkIndex != nil && *state.ChunkIndex == *chunk.Index {
+						// Accumulate the JSON and don't emit anything
+						state.AccumulatedJSON += *chunk.Delta.PartialJSON
 						return nil, nil, false
 					}
 
@@ -1621,16 +915,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 			case AnthropicStreamDeltaTypeThinking:
 				// Reasoning/thinking content delta
 				if chunk.Delta.Thinking != nil && *chunk.Delta.Thinking != "" {
-					// Accumulate the text so content_block_stop can emit it on
-					// reasoning_summary_text.done and the completed reasoning item
-					if state.ReasoningTextBuffers == nil {
-						state.ReasoningTextBuffers = make(map[int]*strings.Builder)
-					}
-					if state.ReasoningTextBuffers[outputIndex] == nil {
-						state.ReasoningTextBuffers[outputIndex] = &strings.Builder{}
-					}
-					state.ReasoningTextBuffers[outputIndex].WriteString(*chunk.Delta.Thinking)
-
 					itemID := state.ItemIDs[outputIndex]
 					response := &schemas.BifrostResponsesStreamResponse{
 						Type:           schemas.ResponsesStreamResponseTypeReasoningSummaryTextDelta,
@@ -1693,28 +977,19 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 	case AnthropicStreamEventTypeContentBlockStop:
 		// Content block is complete - emit output_item.done (OpenAI-style)
 		if chunk.Index != nil {
-			// Data-less redacted_thinking: its start reserved no output index, so
-			// its stop must not reserve one (or synthesize a done) either.
-			if blockType, exists := state.ContentIndexToBlockType[*chunk.Index]; exists &&
-				blockType == AnthropicContentBlockTypeRedactedThinking {
-				delete(state.ContentIndexToBlockType, *chunk.Index)
-				return nil, nil, false
-			}
-
 			outputIndex := state.getOrCreateOutputIndex(chunk.Index)
 
-			if inputJSON, inputKind, hasInputBuffer := state.finishInputJSONBuffer(chunk.Index); hasInputBuffer {
-				switch inputKind {
-				case anthropicInputJSONBufferComputer:
-					if state.ComputerToolID == nil {
-						return nil, nil, false
-					}
+			// Check if this is the end of a tool accumulation (computer or web search query)
+			if state.ChunkIndex != nil && *state.ChunkIndex == *chunk.Index {
+
+				// Computer tool completion
+				if state.ComputerToolID != nil {
 					// Parse accumulated JSON and convert to OpenAI format
 					var inputMap map[string]interface{}
 					var action *schemas.ResponsesComputerToolCallAction
 
-					if inputJSON != "" {
-						if err := sonic.Unmarshal([]byte(inputJSON), &inputMap); err == nil {
+					if state.AccumulatedJSON != "" {
+						if err := sonic.Unmarshal([]byte(state.AccumulatedJSON), &inputMap); err == nil {
 							action = convertAnthropicToResponsesComputerAction(inputMap)
 						}
 					}
@@ -1740,7 +1015,10 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 						}
 					}
 
+					// Clear computer tool state
 					state.ComputerToolID = nil
+					state.ChunkIndex = nil
+					state.AccumulatedJSON = ""
 
 					// Return output_item.done
 					return []*schemas.BifrostResponsesStreamResponse{
@@ -1752,88 +1030,13 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 							Item:           item,
 						},
 					}, nil, false
+				}
 
-				case anthropicInputJSONBufferWebSearch:
-					if state.WebSearchToolID == nil {
-						return nil, nil, false
-					}
-					if state.WebSearchQuery == nil && inputJSON != "" {
-						if q := providerUtils.GetJSONField([]byte(inputJSON), "query"); q.Exists() && q.Type == gjson.String {
-							state.WebSearchQuery = schemas.Ptr(q.Str)
-						}
-					}
-					return nil, nil, false
-
-				case anthropicInputJSONBufferWebFetch:
-					// Fallback: recover the URL if Anthropic streamed it via
-					// input_json_delta instead of inlining it in content_block_start
-					// (mirrors the web_search query fallback above).
-					if state.WebFetchURL == nil && inputJSON != "" {
-						if u := providerUtils.GetJSONField([]byte(inputJSON), "url"); u.Exists() && u.Type == gjson.String {
-							state.WebFetchURL = schemas.Ptr(u.Str)
-						}
-					}
-					return nil, nil, false
-
-				case anthropicInputJSONBufferAdvisor:
-					return nil, nil, false
-
-				case anthropicInputJSONBufferCodeExec:
-					if state.CodeExecToolID == nil {
-						return nil, nil, false
-					}
-					// Code-execution server_tool_use block ended — decode the code from
-					// the accumulated input JSON and emit code.delta + code.done +
-					// interpreting; the result block is folded in later.
-					state.CodeExecInput = inputJSON
-					code := ""
-					if inputJSON != "" {
-						key := "code"
-						if state.CodeExecToolName != nil &&
-							AnthropicToolName(*state.CodeExecToolName) == AnthropicToolNameBashCodeExecution {
-							key = "command"
-						}
-						if c := providerUtils.GetJSONField([]byte(inputJSON), key); c.Exists() && c.Type == gjson.String {
-							code = c.Str
-						}
-					}
-					outIdx := state.CodeExecOutputIndex
-					itemID := state.CodeExecToolID
-
-					var responses []*schemas.BifrostResponsesStreamResponse
-					if code != "" {
-						responses = append(responses, &schemas.BifrostResponsesStreamResponse{
-							Type:           schemas.ResponsesStreamResponseTypeCodeInterpreterCallCodeDelta,
-							SequenceNumber: sequenceNumber + len(responses),
-							OutputIndex:    outIdx,
-							ItemID:         itemID,
-							Delta:          schemas.Ptr(code),
-						})
-					}
-					// Capture the offset once: both struct literals are evaluated before
-					// the variadic append reassigns responses, so reading len(responses)
-					// in each would yield the same (duplicate) sequence number.
-					codeDoneIdx := sequenceNumber + len(responses)
-					responses = append(responses,
-						&schemas.BifrostResponsesStreamResponse{
-							Type:           schemas.ResponsesStreamResponseTypeCodeInterpreterCallCodeDone,
-							SequenceNumber: codeDoneIdx,
-							OutputIndex:    outIdx,
-							ItemID:         itemID,
-							Code:           schemas.Ptr(code),
-						},
-						&schemas.BifrostResponsesStreamResponse{
-							Type:           schemas.ResponsesStreamResponseTypeCodeInterpreterCallInterpreting,
-							SequenceNumber: codeDoneIdx + 1,
-							OutputIndex:    outIdx,
-							ItemID:         itemID,
-						},
-					)
-					return responses, nil, false
-
-				case anthropicInputJSONBufferToolSearch:
-					// tool_search server_tool_use query block ended — the search runs
-					// server-side, so just wait for the tool_search_tool_result block.
+				// Web search query block ended (don't emit output_item.done yet - wait for result)
+				if state.WebSearchToolID != nil {
+					// Clear ChunkIndex (done accumulating query)
+					// Keep WebSearchToolID, WebSearchOutputIndex, and AccumulatedJSON (need them for final item)
+					state.ChunkIndex = nil
 					return nil, nil, false
 				}
 			}
@@ -1841,12 +1044,14 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 			// Check if this is the end of a web_search_tool_result block
 			if state.WebSearchResult != nil && state.WebSearchToolID != nil {
 
-				// Use the query captured from the server_tool_use input at block start
+				// Parse the query from AccumulatedJSON
 				var query string
 				var queries []string
-				if state.WebSearchQuery != nil {
-					query = *state.WebSearchQuery
-					queries = []string{query}
+				if state.AccumulatedJSON != "" {
+					if q := providerUtils.GetJSONField([]byte(state.AccumulatedJSON), "query"); q.Exists() && q.Type == gjson.String {
+						query = q.Str
+						queries = []string{q.Str}
+					}
 				}
 
 				// Extract sources from the result block
@@ -1877,21 +1082,16 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 					action.Queries = queries
 				}
 
-				toolMsg := &schemas.ResponsesToolMessage{
-					CallID: state.WebSearchToolID,
-					Action: &schemas.ResponsesToolMessageActionStruct{ResponsesWebSearchToolCallAction: action},
-				}
-				if state.WebSearchCaller != nil {
-					toolMsg.Caller = &schemas.ResponsesToolCaller{
-						Type:   string(state.WebSearchCaller.Type),
-						ToolID: state.WebSearchCaller.ToolID,
-					}
-				}
 				item := &schemas.ResponsesMessage{
-					ID:                   state.WebSearchToolID,
-					Type:                 schemas.Ptr(schemas.ResponsesMessageTypeWebSearchCall),
-					Status:               &statusCompleted,
-					ResponsesToolMessage: toolMsg,
+					ID:     state.WebSearchToolID,
+					Type:   schemas.Ptr(schemas.ResponsesMessageTypeWebSearchCall),
+					Status: &statusCompleted,
+					ResponsesToolMessage: &schemas.ResponsesToolMessage{
+						CallID: state.WebSearchToolID,
+						Action: &schemas.ResponsesToolMessageActionStruct{
+							ResponsesWebSearchToolCallAction: action,
+						},
+					},
 				}
 
 				outputIdx := state.WebSearchOutputIndex
@@ -1900,8 +1100,7 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 				state.WebSearchToolID = nil
 				state.WebSearchOutputIndex = nil
 				state.WebSearchResult = nil
-				state.WebSearchQuery = nil
-				state.WebSearchCaller = nil
+				state.AccumulatedJSON = ""
 
 				if chunk.Index != nil {
 					delete(state.ContentIndexToBlockType, *chunk.Index)
@@ -1919,226 +1118,17 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 				}, nil, false
 			}
 
-			// End of a web_fetch_tool_result block — emit the web_fetch_call done with
-			// the typed result payload so Anthropic-compatible reverse conversion can
-			// faithfully rebuild the server_tool_use + web_fetch_tool_result pair.
-			if state.WebFetchResult != nil && state.WebFetchToolID != nil {
-				toolMsg := &schemas.ResponsesToolMessage{CallID: state.WebFetchToolID}
-				if state.WebFetchURL != nil {
-					toolMsg.Action = &schemas.ResponsesToolMessageActionStruct{
-						ResponsesWebFetchToolCallAction: &schemas.ResponsesWebFetchToolCallAction{
-							Type: "fetch",
-							URL:  *state.WebFetchURL,
-						},
-					}
-				}
-				toolMsg.ResponsesWebFetchCall = convertAnthropicWebFetchResultToBifrost(state.WebFetchResult)
-				item := &schemas.ResponsesMessage{
-					ID:                   state.WebFetchToolID,
-					Type:                 schemas.Ptr(schemas.ResponsesMessageTypeWebFetchCall),
-					Status:               schemas.Ptr("completed"),
-					ResponsesToolMessage: toolMsg,
-				}
-				outputIdx := state.WebFetchOutputIndex
-
-				state.WebFetchToolID = nil
-				state.WebFetchOutputIndex = nil
-				state.WebFetchURL = nil
-				state.WebFetchResult = nil
-
-				if chunk.Index != nil {
-					delete(state.ContentIndexToBlockType, *chunk.Index)
-				}
-
-				return []*schemas.BifrostResponsesStreamResponse{
-					{
-						Type:           schemas.ResponsesStreamResponseTypeOutputItemDone,
-						SequenceNumber: sequenceNumber,
-						OutputIndex:    outputIdx,
-						ContentIndex:   chunk.Index,
-						Item:           item,
-					},
-				}, nil, false
-			}
-
-			// End of an advisor_tool_result block — emit the advisor_call done.
-			if state.AdvisorResult != nil && state.AdvisorToolID != nil {
-				advisor := &schemas.ResponsesAdvisorCall{}
-				// content is a single object on the wire (ContentObj); UnmarshalJSON
-				// wraps incoming objects into ContentBlocks, so accept either.
-				if c := state.AdvisorResult.Content; c != nil {
-					inner := c.ContentObj
-					if inner == nil && len(c.ContentBlocks) > 0 {
-						inner = &c.ContentBlocks[0]
-					}
-					if inner != nil {
-						advisor.ResultType = string(inner.Type)
-						advisor.Text = inner.Text
-						advisor.EncryptedContent = inner.EncryptedContent
-						advisor.ErrorCode = inner.ErrorCode
-						advisor.StopReason = inner.StopReason
-					}
-				}
-				item := &schemas.ResponsesMessage{
-					ID:     state.AdvisorToolID,
-					Type:   schemas.Ptr(schemas.ResponsesMessageTypeAdvisorCall),
-					Status: schemas.Ptr("completed"),
-					ResponsesToolMessage: &schemas.ResponsesToolMessage{
-						CallID:               state.AdvisorToolID,
-						Name:                 schemas.Ptr(string(AnthropicToolNameAdvisor)),
-						ResponsesAdvisorCall: advisor,
-					},
-				}
-				outputIdx := state.AdvisorOutputIndex
-				// Persist into OutputItems so message_stop includes the advisor_call
-				// in response.completed (mirrors the web_search_call handling).
-				if outputIdx != nil {
-					cloned := *item
-					clonedToolMsg := *item.ResponsesToolMessage
-					cloned.ResponsesToolMessage = &clonedToolMsg
-					state.OutputItems[*outputIdx] = &cloned
-				}
-				state.AdvisorToolID = nil
-				state.AdvisorOutputIndex = nil
-				state.AdvisorResult = nil
-				if chunk.Index != nil {
-					delete(state.ContentIndexToBlockType, *chunk.Index)
-				}
-				return []*schemas.BifrostResponsesStreamResponse{{
-					Type:           schemas.ResponsesStreamResponseTypeOutputItemDone,
-					SequenceNumber: sequenceNumber,
-					OutputIndex:    outputIdx,
-					ContentIndex:   chunk.Index,
-					Item:           item,
-				}}, nil, false
-			}
-
-			// End of a tool_search_tool_result block — emit the tool_search_call done
-			// carrying the discovered tool references (the deferred tools the search found).
-			// Mirrors the web_search_call done; the model's subsequent tool_use (calling one
-			// of those tools) is forwarded by the generic tool_use path.
-			if state.ToolSearchResult != nil && state.ToolSearchToolID != nil {
-				var toolRefs []string
-				for _, ref := range state.ToolSearchResult.ToolReferences {
-					if ref.ToolName != nil {
-						toolRefs = append(toolRefs, *ref.ToolName)
-					} else if ref.Name != nil {
-						toolRefs = append(toolRefs, *ref.Name)
-					}
-				}
-				item := &schemas.ResponsesMessage{
-					ID:     state.ToolSearchToolID,
-					Type:   schemas.Ptr(schemas.ResponsesMessageTypeToolSearchCall),
-					Status: schemas.Ptr("completed"),
-					ResponsesToolMessage: &schemas.ResponsesToolMessage{
-						CallID:                  state.ToolSearchToolID,
-						Name:                    state.ToolSearchToolName,
-						ResponsesToolSearchCall: &schemas.ResponsesToolSearchCall{ToolReferences: toolRefs},
-					},
-				}
-				outputIdx := state.ToolSearchOutputIndex
-				// Persist into OutputItems so message_stop includes the tool_search_call
-				// in response.completed (mirrors web_search_call / advisor_call handling).
-				if outputIdx != nil {
-					cloned := *item
-					clonedToolMsg := *item.ResponsesToolMessage
-					cloned.ResponsesToolMessage = &clonedToolMsg
-					state.OutputItems[*outputIdx] = &cloned
-				}
-				state.ToolSearchToolID = nil
-				state.ToolSearchToolName = nil
-				state.ToolSearchOutputIndex = nil
-				state.ToolSearchResult = nil
-				if chunk.Index != nil {
-					delete(state.ContentIndexToBlockType, *chunk.Index)
-				}
-				return []*schemas.BifrostResponsesStreamResponse{{
-					Type:           schemas.ResponsesStreamResponseTypeOutputItemDone,
-					SequenceNumber: sequenceNumber,
-					OutputIndex:    outputIdx,
-					ContentIndex:   chunk.Index,
-					Item:           item,
-				}}, nil, false
-			}
-
-			// End of a code-execution result block — emit the code_interpreter_call done.
-			if state.CodeExecResult != nil && state.CodeExecToolID != nil {
-				// Rebuild the server_tool_use block from accumulated state so the
-				// streamed item is identical to the non-streaming converter output.
-				serverBlock := AnthropicContentBlock{
-					Type: AnthropicContentBlockTypeServerToolUse,
-					ID:   state.CodeExecToolID,
-					Name: state.CodeExecToolName,
-				}
-				// Use the input captured when the server_tool_use block closed.
-				if state.CodeExecInput != "" {
-					serverBlock.Input = json.RawMessage(state.CodeExecInput)
-				}
-				msgs := []schemas.ResponsesMessage{buildBifrostCodeExecutionCall(serverBlock)}
-				attachAnthropicCodeExecutionResult(msgs, *state.CodeExecToolID, *state.CodeExecResult)
-				item := &msgs[0]
-
-				outputIdx := state.CodeExecOutputIndex
-				itemID := state.CodeExecToolID
-				// Persist into OutputItems so response.completed includes the call;
-				// the sandbox container is folded in at message_stop.
-				if outputIdx != nil {
-					cloned := *item
-					if item.ResponsesToolMessage != nil {
-						clonedTM := *item.ResponsesToolMessage
-						cloned.ResponsesToolMessage = &clonedTM
-					}
-					state.OutputItems[*outputIdx] = &cloned
-				}
-
-				state.CodeExecToolID = nil
-				state.CodeExecToolName = nil
-				state.CodeExecOutputIndex = nil
-				state.CodeExecResult = nil
-				state.CodeExecInput = ""
-				if chunk.Index != nil {
-					delete(state.ContentIndexToBlockType, *chunk.Index)
-				}
-
-				return []*schemas.BifrostResponsesStreamResponse{
-					{
-						Type:           schemas.ResponsesStreamResponseTypeCodeInterpreterCallCompleted,
-						SequenceNumber: sequenceNumber,
-						OutputIndex:    outputIdx,
-						ItemID:         itemID,
-					},
-					{
-						Type:           schemas.ResponsesStreamResponseTypeOutputItemDone,
-						SequenceNumber: sequenceNumber + 1,
-						OutputIndex:    outputIdx,
-						ContentIndex:   chunk.Index,
-						Item:           item,
-					},
-				}, nil, false
-			}
-
 			// Skip generic output_item.done if this is a web_search_tool_result or compaction block
 			// (their handlers already emitted the proper done event)
 			if chunk.Index != nil {
 				if blockType, exists := state.ContentIndexToBlockType[*chunk.Index]; exists {
 					if blockType == AnthropicContentBlockTypeWebSearchToolResult ||
-						blockType == AnthropicContentBlockTypeWebFetchToolResult ||
-						blockType == AnthropicContentBlockTypeAdvisorToolResult ||
-						blockType == AnthropicContentBlockTypeToolSearchToolResult ||
-						blockType == AnthropicContentBlockTypeServerToolUse ||
-						blockType == AnthropicContentBlockTypeCodeExecutionToolResult ||
-						blockType == AnthropicContentBlockTypeBashCodeExecutionToolResult ||
-						blockType == AnthropicContentBlockTypeTextEditorCodeExecutionToolResult {
+						blockType == AnthropicContentBlockTypeWebFetchToolResult {
 						delete(state.ContentIndexToBlockType, *chunk.Index)
 						return nil, nil, false
 					}
 					if blockType == AnthropicContentBlockTypeCompaction {
 						// Clean up the tracking
-						delete(state.ContentIndexToBlockType, *chunk.Index)
-						return nil, nil, false
-					}
-					if blockType == AnthropicContentBlockTypeFallback {
-						// output_item.added + done were already emitted at content_block_start.
 						delete(state.ContentIndexToBlockType, *chunk.Index)
 						return nil, nil, false
 					}
@@ -2199,64 +1189,26 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 
 				// Check if this content index is a reasoning block
 				if state.ReasoningContentIndices[*chunk.Index] {
-					// Capture the accumulated reasoning text and signature
-					accReasoning := ""
-					if buf := state.ReasoningTextBuffers[outputIndex]; buf != nil {
-						accReasoning = buf.String()
-						delete(state.ReasoningTextBuffers, outputIndex)
-					}
-					var signature *string
-					if sig, ok := state.ReasoningSignatures[outputIndex]; ok && sig != "" {
-						sigCopy := sig
-						signature = &sigCopy
-						delete(state.ReasoningSignatures, outputIndex)
-					}
-
-					// Fold them into the stored item with the same shape the
-					// non-streaming converter produces (a reasoning_text content
-					// block carrying text + signature), so output_item.done and
-					// response.completed carry a replayable reasoning item.
-					if storedItem, exists := state.OutputItems[outputIndex]; exists {
-						textCopy := accReasoning
-						storedItem.Content = &schemas.ResponsesMessageContent{
-							ContentBlocks: []schemas.ResponsesMessageContentBlock{
-								{
-									Type:      schemas.ResponsesOutputMessageContentTypeReasoning,
-									Text:      &textCopy,
-									Signature: signature,
-								},
-							},
-						}
-						storedItem.ResponsesReasoning = nil
-					}
-
-					// Emit reasoning_summary_text.done (reasoning equivalent of
-					// output_text.done) with the full accumulated text
-					doneText := accReasoning
+					// Emit reasoning_summary_text.done (reasoning equivalent of output_text.done)
+					emptyText := ""
 					reasoningDoneResponse := &schemas.BifrostResponsesStreamResponse{
 						Type:           schemas.ResponsesStreamResponseTypeReasoningSummaryTextDone,
 						SequenceNumber: sequenceNumber + len(responses),
 						OutputIndex:    schemas.Ptr(outputIndex),
 						ContentIndex:   chunk.Index,
-						Text:           &doneText,
+						Text:           &emptyText,
 					}
 					if itemID != "" {
 						reasoningDoneResponse.ItemID = &itemID
 					}
 					responses = append(responses, reasoningDoneResponse)
 
-					// Emit content_part.done for reasoning with the completed part
-					partText := accReasoning
+					// Emit content_part.done for reasoning
 					partDoneResponse := &schemas.BifrostResponsesStreamResponse{
 						Type:           schemas.ResponsesStreamResponseTypeContentPartDone,
 						SequenceNumber: sequenceNumber + len(responses),
 						OutputIndex:    schemas.Ptr(outputIndex),
 						ContentIndex:   chunk.Index,
-						Part: &schemas.ResponsesMessageContentBlock{
-							Type:      schemas.ResponsesOutputMessageContentTypeReasoning,
-							Text:      &partText,
-							Signature: signature,
-						},
 					}
 					if itemID != "" {
 						partDoneResponse.ItemID = &itemID
@@ -2297,10 +1249,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 				if itemID != "" {
 					item.ID = &itemID
 				}
-				var itemIDPtr *string
-				if itemID != "" {
-					itemIDPtr = &itemID
-				}
 
 				// Emit output_item.added for the text message
 				responses = append(responses, &schemas.BifrostResponsesStreamResponse{
@@ -2309,72 +1257,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 					OutputIndex:    schemas.Ptr(outputIndex),
 					ContentIndex:   chunk.Index,
 					Item:           item,
-				})
-
-				// Emit the same content_part / output_text events an ordinary text
-				// block emits. Without them a consumer that reads the incremental
-				// events rather than the item snapshot — the Gemini /genai stream
-				// converter, the OpenAI Responses SDK — sees a stream with no text
-				// in it, which is how a schema-constrained request to a tool-based
-				// structured-output provider (Vertex, Bedrock Mantle, Azure) came
-				// back empty while the same request without a schema streamed fine.
-				//
-				// The whole document goes out in one delta rather than replaying the
-				// input_json_delta fragments: a tool call's arguments are only valid
-				// JSON once complete, so forwarding `{"text":` as a text delta would
-				// hand a parse error to any client decoding deltas as they arrive.
-				emptyText := ""
-				responses = append(responses, &schemas.BifrostResponsesStreamResponse{
-					Type:           schemas.ResponsesStreamResponseTypeContentPartAdded,
-					SequenceNumber: sequenceNumber + len(responses),
-					OutputIndex:    schemas.Ptr(outputIndex),
-					ContentIndex:   chunk.Index,
-					ItemID:         itemIDPtr,
-					Part: &schemas.ResponsesMessageContentBlock{
-						Type: schemas.ResponsesOutputMessageContentTypeText,
-						Text: &emptyText,
-						ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
-							Annotations: []schemas.ResponsesOutputMessageContentTextAnnotation{},
-							LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
-						},
-					},
-				})
-
-				deltaText := textContent
-				responses = append(responses, &schemas.BifrostResponsesStreamResponse{
-					Type:           schemas.ResponsesStreamResponseTypeOutputTextDelta,
-					SequenceNumber: sequenceNumber + len(responses),
-					OutputIndex:    schemas.Ptr(outputIndex),
-					ContentIndex:   chunk.Index,
-					ItemID:         itemIDPtr,
-					Delta:          &deltaText,
-				})
-
-				doneText := textContent
-				responses = append(responses, &schemas.BifrostResponsesStreamResponse{
-					Type:           schemas.ResponsesStreamResponseTypeOutputTextDone,
-					SequenceNumber: sequenceNumber + len(responses),
-					OutputIndex:    schemas.Ptr(outputIndex),
-					ContentIndex:   chunk.Index,
-					ItemID:         itemIDPtr,
-					Text:           &doneText,
-				})
-
-				partText := textContent
-				responses = append(responses, &schemas.BifrostResponsesStreamResponse{
-					Type:           schemas.ResponsesStreamResponseTypeContentPartDone,
-					SequenceNumber: sequenceNumber + len(responses),
-					OutputIndex:    schemas.Ptr(outputIndex),
-					ContentIndex:   chunk.Index,
-					ItemID:         itemIDPtr,
-					Part: &schemas.ResponsesMessageContentBlock{
-						Type: schemas.ResponsesOutputMessageContentTypeText,
-						Text: &partText,
-						ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
-							Annotations: []schemas.ResponsesOutputMessageContentTextAnnotation{},
-							LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
-						},
-					},
 				})
 
 				// Emit output_item.done
@@ -2489,11 +1371,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 		}
 
 	case AnthropicStreamEventTypeMessageDelta:
-		// The sandbox container is delivered here, after all content blocks; fold
-		// it onto the code_interpreter_call(s) at message_stop.
-		if chunk.Delta.Container != nil {
-			state.Container = chunk.Delta.Container
-		}
 		if chunk.Delta.StopReason != nil {
 			mapped := ConvertAnthropicFinishReasonToBifrost(*chunk.Delta.StopReason)
 			if state.UsedStructuredOutputTool && !state.SeenRealToolCall &&
@@ -2501,9 +1378,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 				mapped = string(schemas.BifrostFinishReasonStop)
 			}
 			state.StopReason = &mapped
-		}
-		if chunk.Delta.StopDetails != nil {
-			state.StopDetails = stopDetailsToBifrost(chunk.Delta.StopDetails)
 		}
 		// Check if integration type in ctx is anthropic
 		if ctx.Value(schemas.BifrostContextKeyIntegrationType) == "anthropic" {
@@ -2529,19 +1403,8 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 			if stopReason != nil {
 				response.StopReason = stopReason
 			}
-			response.StopDetails = state.StopDetails
 			if bifrostUsage != nil {
 				response.Usage = bifrostUsage
-				response.Speed = chunk.Usage.Speed
-				response.InferenceGeo = chunk.Usage.InferenceGeo
-			}
-			// Carry the sandbox container on the message_delta event so the reverse
-			// converter can re-emit it (Anthropic delivers it here, not earlier).
-			if state.Container != nil {
-				response.Container = &schemas.ResponsesResponseContainer{
-					ID:        state.Container.ID,
-					ExpiresAt: state.Container.ExpiresAt,
-				}
 			}
 
 			// Mark that we already emitted a message_delta so response.completed
@@ -2572,36 +1435,6 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 		}
 		if state.StopReason != nil {
 			response.StopReason = state.StopReason
-		}
-		response.StopDetails = state.StopDetails
-
-		// Fold the sandbox container (delivered on the final message_delta) onto
-		// every code_interpreter_call so response.completed carries it (mirrors the
-		// non-streaming container lift in ToBifrostResponsesResponse). Also expose it
-		// at the response level so the reverse converter can re-emit it if it builds
-		// the message_delta from this completed event.
-		if state.Container != nil {
-			response.Container = &schemas.ResponsesResponseContainer{
-				ID:        state.Container.ID,
-				ExpiresAt: state.Container.ExpiresAt,
-			}
-			for _, item := range state.OutputItems {
-				if item == nil || item.Type == nil ||
-					*item.Type != schemas.ResponsesMessageTypeCodeInterpreterCall ||
-					item.ResponsesToolMessage == nil {
-					continue
-				}
-				if item.ResponsesToolMessage.ResponsesCodeInterpreterToolCall == nil {
-					item.ResponsesToolMessage.ResponsesCodeInterpreterToolCall = &schemas.ResponsesCodeInterpreterToolCall{}
-				}
-				item.ResponsesToolMessage.ResponsesCodeInterpreterToolCall.ContainerID = state.Container.ID
-				if state.Container.ExpiresAt != nil {
-					if item.ResponsesToolMessage.ResponsesCodeExecutionCall == nil {
-						item.ResponsesToolMessage.ResponsesCodeExecutionCall = &schemas.ResponsesCodeExecutionCall{}
-					}
-					item.ResponsesToolMessage.ResponsesCodeExecutionCall.ContainerExpiresAt = state.Container.ExpiresAt
-				}
-			}
 		}
 
 		// Populate the Output array from accumulated items for response.completed
@@ -2650,68 +1483,8 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 	return nil, nil, false
 }
 
-// ToAnthropicResponsesStreamResponse converts a Bifrost Responses stream response
-// to Anthropic SSE frames, enforcing the content-block invariant every Anthropic
-// client assembles against: a content_block_delta must match the type its
-// content_block_start opened.
-//
-// This is the single frame source for every non-Claude model -- the raw passthrough
-// path that interleaves verbatim upstream frames only applies to Claude models (see
-// shouldUsePassthrough in the transport) -- so guarding here covers the whole
-// surface. The branches below each choose a block type independently and cannot see
-// what the others opened, which is how a reasoning block opened as redacted_thinking
-// and a tool call opened as thinking both reached clients and aborted their turns.
+// ToAnthropicResponsesStreamResponse converts a Bifrost Responses stream response to Anthropic SSE string format
 func ToAnthropicResponsesStreamResponse(ctx *schemas.BifrostContext, bifrostResp *schemas.BifrostResponsesStreamResponse) []*AnthropicStreamEvent {
-	events := toAnthropicResponsesStreamEvents(ctx, bifrostResp)
-	if len(events) == 0 || ctx == nil {
-		return events
-	}
-	return enforceStreamBlockTypes(getOrCreateAnthropicToResponsesStreamState(ctx), events)
-}
-
-// enforceStreamBlockTypes tracks the type each content_block_start opens and drops
-// any content_block_delta that block cannot accept.
-//
-// Dropping is deliberately asymmetric with the damage: a suppressed delta costs one
-// fragment of reasoning or one signature, while forwarding it ends the client's turn
-// with a hard error.
-//
-// This is a seatbelt, not the fix. A converter branch that trips it has a bug of its
-// own -- the branch chose a block type the delta it later emits cannot land on -- so
-// the tests in streamblocktype_test.go assert the emitted shape directly rather than
-// relying on this to launder it.
-func enforceStreamBlockTypes(state *anthropicToResponsesStreamState, events []*AnthropicStreamEvent) []*AnthropicStreamEvent {
-	kept := events[:0]
-	for _, event := range events {
-		if event == nil || event.Index == nil {
-			kept = append(kept, event)
-			continue
-		}
-		index := *event.Index
-
-		switch event.Type {
-		case AnthropicStreamEventTypeContentBlockStart:
-			if event.ContentBlock != nil {
-				state.setBlockType(index, event.ContentBlock.Type)
-			}
-		case AnthropicStreamEventTypeContentBlockDelta:
-			// An index with no recorded start is left alone: block-index bookkeeping
-			// desyncs are blockIndexMisses' job to surface, and dropping the delta
-			// here would mask that separate defect behind this one.
-			if blockType := state.blockType(index); blockType != "" && event.Delta != nil &&
-				!blockAcceptsDeltaType(blockType, event.Delta.Type) {
-				continue
-			}
-		case AnthropicStreamEventTypeContentBlockStop:
-			state.setBlockType(index, "")
-		}
-
-		kept = append(kept, event)
-	}
-	return kept
-}
-
-func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *schemas.BifrostResponsesStreamResponse) []*AnthropicStreamEvent {
 	if bifrostResp == nil {
 		return nil
 	}
@@ -2723,31 +1496,13 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 	case schemas.ResponsesStreamResponseTypeCreated:
 		// Only convert response.created back to message_start (not response.in_progress to avoid duplicates)
 		streamResp.Type = AnthropicStreamEventTypeMessageStart
-		{
-			// The message object is built unconditionally, even when the created event
-			// carries no BifrostResponsesResponse at all: a bare {"type":"message_start"}
-			// fails the same strict-client validation as one missing usage, and there is
-			// always enough in ExtraFields to render a usable frame.
-			//
-			// Use actual usage if available (forwarded from upstream message_start).
-			// When unknown — Bedrock Converse reports usage only on its terminal event,
-			// and every provider routed through providerUtils.SendCreatedEventResponsesChunk
-			// hands us an empty BifrostResponsesResponse — the key must still be emitted.
-			// message_start.usage is not optional in practice: Anthropic populates it on
-			// every real stream, and @ai-sdk/anthropic's message_start schema marks
-			// usage.input_tokens required (id/model/role are nullish), so omitting it
-			// aborts the stream before the first token reaches the client (see #5885).
-			//
-			// Zeros rather than Anthropic's own output_tokens:1 placeholder: the frame is
-			// provisional either way, but Bifrost's Bedrock message_delta carries absolute
-			// totals rather than Anthropic's cumulative deltas, so a client that sums the
-			// two would over-count. Zero is neutral under both readings, and the terminal
-			// message_delta remains the authoritative source of the real figures.
+		if bifrostResp.Response != nil {
+			// Use actual usage if available (forwarded from upstream message_start),
+			// otherwise fall back to zeros for non-Anthropic providers
 			var messageUsage *AnthropicUsage
-			if bifrostResp.Response != nil && bifrostResp.Response.Usage != nil {
+			if bifrostResp.Response.Usage != nil {
 				messageUsage = ConvertBifrostUsageToAnthropicUsage(bifrostResp.Response.Usage)
-			}
-			if messageUsage == nil {
+			} else {
 				messageUsage = &AnthropicUsage{
 					InputTokens:              0,
 					OutputTokens:             0,
@@ -2765,7 +1520,7 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 				Content: []AnthropicContentBlock{}, // Always empty array in message_start
 				Usage:   messageUsage,
 			}
-			if bifrostResp.Response != nil && bifrostResp.Response.ID != nil {
+			if bifrostResp.Response.ID != nil {
 				streamMessage.ID = *bifrostResp.Response.ID
 			}
 			// Prefer Response.Model, then ResolvedModelUsed, then OriginalModelRequested
@@ -2776,10 +1531,6 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 			} else if bifrostResp.ExtraFields.OriginalModelRequested != "" {
 				streamMessage.Model = bifrostResp.ExtraFields.OriginalModelRequested
 			}
-			// Cache diagnostics arrives on message_start (cache-diagnosis-2026-04-07).
-			if bifrostResp.Response != nil && bifrostResp.Response.Diagnostics != nil {
-				streamMessage.Diagnostics = bifrostResp.Response.Diagnostics
-			}
 			streamResp.Message = streamMessage
 		}
 	case schemas.ResponsesStreamResponseTypeInProgress:
@@ -2788,12 +1539,6 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 		return nil
 
 	case schemas.ResponsesStreamResponseTypeOutputItemAdded:
-		// Every output item starts exactly one primary Anthropic content block here;
-		// allocate its index once (deltas/stops look it up, result blocks get fresh
-		// indices). This is the single source of truth for block numbering.
-		addedState := getOrCreateAnthropicToResponsesStreamState(ctx)
-		blockIdx := addedState.allocBlockIndex(reverseStreamItemKey(bifrostResp))
-
 		// Check if this is a computer tool call
 		if bifrostResp.Item != nil &&
 			bifrostResp.Item.Type != nil &&
@@ -2801,14 +1546,19 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 
 			// Computer tool - emit content_block_start
 			streamResp.Type = AnthropicStreamEventTypeContentBlockStart
-			streamResp.Index = blockIdx
+
+			if bifrostResp.OutputIndex != nil {
+				streamResp.Index = bifrostResp.OutputIndex
+			} else if bifrostResp.ContentIndex != nil {
+				streamResp.Index = bifrostResp.ContentIndex
+			}
 
 			// Build the content_block as tool_use
 			// Note: Computer tool calls should not be converted to thinking blocks
 			contentBlock := &AnthropicContentBlock{
 				Type: AnthropicContentBlockTypeToolUse,
-				ID:   providerUtils.SanitizeAnthropicToolUseIDPtr(bifrostResp.Item.ID), // The tool use ID
-				Name: schemas.Ptr(string(AnthropicToolNameComputer)),                   // "computer"
+				ID:   bifrostResp.Item.ID,                            // The tool use ID
+				Name: schemas.Ptr(string(AnthropicToolNameComputer)), // "computer"
 			}
 
 			// Always start with empty input for streaming compatibility
@@ -2821,100 +1571,33 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 
 			// Web search call - emit content_block_start with server_tool_use
 			streamResp.Type = AnthropicStreamEventTypeContentBlockStart
-			streamResp.Index = blockIdx
+
+			if bifrostResp.ContentIndex != nil {
+				streamResp.Index = bifrostResp.ContentIndex
+			} else if bifrostResp.OutputIndex != nil {
+				streamResp.Index = bifrostResp.OutputIndex
+			}
 
 			// Build the content_block as server_tool_use
 			contentBlock := &AnthropicContentBlock{
 				Type: AnthropicContentBlockTypeServerToolUse,
-				ID:   providerUtils.SanitizeAnthropicToolUseIDPtr(bifrostResp.Item.ID), // The tool use ID
-				Name: schemas.Ptr(string(AnthropicToolNameWebSearch)),                  // "web_search"
+				ID:   bifrostResp.Item.ID,                             // The tool use ID
+				Name: schemas.Ptr(string(AnthropicToolNameWebSearch)), // "web_search"
 			}
 
-			// Deliver the query whole in content_block_start (no input_json_delta),
-			// matching native: a web_search is spawned atomically (in PTC, by the
-			// sandbox), so Anthropic never streams its input. Fall back to empty.
+			// Start with empty input for streaming compatibility
 			contentBlock.Input = json.RawMessage("{}")
-			if tm := bifrostResp.Item.ResponsesToolMessage; tm != nil && tm.Action != nil &&
-				tm.Action.ResponsesWebSearchToolCallAction != nil &&
-				tm.Action.ResponsesWebSearchToolCallAction.Query != nil {
-				if inputBytes, err := providerUtils.MarshalSorted(map[string]interface{}{"query": *tm.Action.ResponsesWebSearchToolCallAction.Query}); err == nil {
-					contentBlock.Input = json.RawMessage(inputBytes)
-				}
-			}
-
-			// Preserve the caller (set when this search was spawned from inside the
-			// code execution sandbox — programmatic tool calling).
-			if tm := bifrostResp.Item.ResponsesToolMessage; tm != nil && tm.Caller != nil {
-				contentBlock.Caller = &AnthropicToolCaller{
-					Type:   AnthropicToolCallerType(tm.Caller.Type),
-					ToolID: providerUtils.SanitizeAnthropicToolUseIDPtr(tm.Caller.ToolID),
-				}
-			}
 
 			streamResp.ContentBlock = contentBlock
-		} else if bifrostResp.Item != nil &&
-			bifrostResp.Item.Type != nil &&
-			*bifrostResp.Item.Type == schemas.ResponsesMessageTypeAdvisorCall {
-
-			// Advisor call - emit content_block_start with server_tool_use (input is always empty)
-			streamResp.Type = AnthropicStreamEventTypeContentBlockStart
-			streamResp.Index = blockIdx
-			toolUseID := bifrostResp.Item.ID
-			if bifrostResp.Item.ResponsesToolMessage != nil && bifrostResp.Item.ResponsesToolMessage.CallID != nil {
-				toolUseID = bifrostResp.Item.ResponsesToolMessage.CallID
-			}
-			toolUseID = providerUtils.SanitizeAnthropicToolUseIDPtr(toolUseID)
-			streamResp.ContentBlock = &AnthropicContentBlock{
-				Type:  AnthropicContentBlockTypeServerToolUse,
-				ID:    toolUseID,
-				Name:  schemas.Ptr(string(AnthropicToolNameAdvisor)),
-				Input: json.RawMessage("{}"),
-			}
-		} else if bifrostResp.Item != nil &&
-			bifrostResp.Item.Type != nil &&
-			*bifrostResp.Item.Type == schemas.ResponsesMessageTypeCodeInterpreterCall {
-
-			// Code interpreter call - emit content_block_start with server_tool_use.
-			// Input is empty here; the verbatim input is streamed at output_item.done.
-			streamResp.Type = AnthropicStreamEventTypeContentBlockStart
-			streamResp.Index = blockIdx
-			toolUseID := bifrostResp.Item.ID
-			toolName := string(AnthropicToolNameCodeExecution)
-			if tm := bifrostResp.Item.ResponsesToolMessage; tm != nil {
-				if tm.CallID != nil {
-					toolUseID = tm.CallID
-				}
-				if tm.ResponsesCodeExecutionCall != nil && tm.ResponsesCodeExecutionCall.ToolName != "" {
-					toolName = tm.ResponsesCodeExecutionCall.ToolName
-				}
-			}
-			// Remember the sub-tool so code.done can rebuild {"code"|"command": …}.
-			if addedState.codeExecToolNameByItem == nil {
-				addedState.codeExecToolNameByItem = make(map[string]string)
-			}
-			addedState.codeExecToolNameByItem[reverseStreamItemKey(bifrostResp)] = toolName
-			streamResp.ContentBlock = &AnthropicContentBlock{
-				Type:  AnthropicContentBlockTypeServerToolUse,
-				ID:    providerUtils.SanitizeAnthropicToolUseIDPtr(toolUseID),
-				Name:  schemas.Ptr(toolName),
-				Input: json.RawMessage("{}"),
-			}
-		} else if bifrostResp.Item != nil &&
-			bifrostResp.Item.Type != nil &&
-			*bifrostResp.Item.Type == schemas.ResponsesMessageTypeWebFetchCall {
-
-			// Web fetch call - emit content_block_start with server_tool_use. The
-			// paired web_fetch_tool_result block is emitted at output_item.done when
-			// the typed result payload is available.
-			streamResp.Type = AnthropicStreamEventTypeContentBlockStart
-			streamResp.Index = blockIdx
-			if blocks := convertBifrostWebFetchCallToAnthropicBlocks(bifrostResp.Item); len(blocks) > 0 {
-				streamResp.ContentBlock = &blocks[0]
-			}
 		} else {
 			// Text or other content blocks - emit content_block_start
 			streamResp.Type = AnthropicStreamEventTypeContentBlockStart
-			streamResp.Index = blockIdx
+			// Use OutputIndex for global Anthropic indexing
+			if bifrostResp.OutputIndex != nil {
+				streamResp.Index = bifrostResp.OutputIndex
+			} else if bifrostResp.ContentIndex != nil {
+				streamResp.Index = bifrostResp.ContentIndex
+			}
 
 			// Build content_block based on item type
 			if bifrostResp.Item != nil {
@@ -2927,121 +1610,87 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 					if bifrostResp.Item.Content.ContentBlocks[0].CacheControl != nil {
 						contentBlock.CacheControl = bifrostResp.Item.Content.ContentBlocks[0].CacheControl
 					}
-				} else if isFallbackItem(bifrostResp.Item) {
-					contentBlock.Type = AnthropicContentBlockTypeFallback
-					if fb := bifrostResp.Item.Content.ContentBlocks[0].ResponsesOutputMessageContentFallback; fb != nil {
-						contentBlock.From = &AnthropicFallbackModel{Model: fb.FromModel}
-						contentBlock.To = &AnthropicFallbackModel{Model: fb.ToModel}
-						if fb.TriggerType != "" {
-							contentBlock.Trigger = &AnthropicFallbackTrigger{Type: fb.TriggerType, Category: fb.TriggerCategory}
-						}
-					}
 				} else if bifrostResp.Item.Type != nil {
 					switch *bifrostResp.Item.Type {
 					case schemas.ResponsesMessageTypeMessage:
 						contentBlock.Type = AnthropicContentBlockTypeText
 						contentBlock.Text = schemas.Ptr("")
 					case schemas.ResponsesMessageTypeReasoning:
-						// embedID gates smuggling the real OpenAI reasoning item id into
-						// signature/data (see providerUtils.ShouldEmbedReasoningItemID and
-						// convertBifrostReasoningToAnthropicThinking for why).
-						embedID := providerUtils.ShouldEmbedReasoningItemID(ctx, bifrostResp.ExtraFields.Provider, bifrostResp.ExtraFields.RoutingInfo.Model)
-						encrypted, hasSummary := reasoningPayloadAndSummary(bifrostResp.Item)
-						// Redacted-only reasoning (encrypted payload, nothing visible) is an
-						// atomic block: the payload rides in `data` on this very frame and no
-						// delta ever follows. Anything with visible reasoning -- or an item
-						// that has not accumulated its payload yet, the normal incremental
-						// case -- must open as `thinking`, because the summary deltas that
-						// follow are only legal against a thinking block. Opening it as
-						// redacted_thinking here made clients discard every thinking_delta
-						// and abort the turn outright on a signature_delta.
-						//
-						// The encrypted half is not dropped: output_item.done emits it as its
-						// own redacted_thinking block, mirroring the non-streaming converter
-						// (see convertBifrostReasoningToAnthropicThinking, which emits the
-						// summary and the encrypted payload as separate blocks for exactly
-						// the same reason).
-						if encrypted != "" && !hasSummary {
-							contentBlock.Type = AnthropicContentBlockTypeRedactedThinking
-							data := encrypted
-							if embedID {
-								data = providerUtils.EmbedReasoningItemID(bifrostResp.Item.ID, data)
+						contentBlock.Type = AnthropicContentBlockTypeThinking
+						contentBlock.Thinking = schemas.Ptr("")
+						contentBlock.Signature = schemas.Ptr("")
+						// Preserve signature if present
+						if bifrostResp.Item.ResponsesReasoning != nil && bifrostResp.Item.ResponsesReasoning.EncryptedContent != nil && *bifrostResp.Item.ResponsesReasoning.EncryptedContent != "" {
+							contentBlock.Data = bifrostResp.Item.ResponsesReasoning.EncryptedContent
+							// When signature is present but thinking content is empty, use redacted_thinking
+							if contentBlock.Thinking != nil && *contentBlock.Thinking == "" {
+								contentBlock.Type = AnthropicContentBlockTypeRedactedThinking
 							}
-							contentBlock.Data = &data
-						} else {
-							contentBlock.Type = AnthropicContentBlockTypeThinking
-							contentBlock.Thinking = schemas.Ptr("")
-							signature := ""
-							if embedID {
-								signature = providerUtils.EmbedReasoningItemID(bifrostResp.Item.ID, "")
-							}
-							contentBlock.Signature = &signature
 						}
 					case schemas.ResponsesMessageTypeFunctionCall:
 						// Check if this item actually has reasoning content (misclassified)
 						// When thinking is enabled, reasoning content might be incorrectly classified as FunctionCall
 						if bifrostResp.Item.ResponsesReasoning != nil {
-							// This is actually reasoning content, not a function call, so it
-							// follows the same rule as the reasoning branch above: open
-							// redacted_thinking only when the encrypted payload is all the item
-							// has. Judging on "has encrypted content" alone downgraded a
-							// summary-bearing item to an atomic block, and the signature_delta
-							// that follows is the frame the client throws
-							// "Content block is not a thinking block" on. The encrypted half is
-							// not dropped -- output_item.done splits it into its own
-							// redacted_thinking block, which is why isReasoningItem has to route
-							// this shape there as well.
-							embedID := providerUtils.ShouldEmbedReasoningItemID(ctx, bifrostResp.ExtraFields.Provider, bifrostResp.ExtraFields.RoutingInfo.Model)
-							encrypted, hasSummary := reasoningPayloadAndSummary(bifrostResp.Item)
-							if encrypted != "" && !hasSummary {
+							// This is actually reasoning content, not a function call
+							contentBlock.Type = AnthropicContentBlockTypeThinking
+							contentBlock.Thinking = schemas.Ptr("")
+							contentBlock.Signature = schemas.Ptr("")
+							// Check if there's encrypted content for redacted_thinking
+							if bifrostResp.Item.ResponsesReasoning.EncryptedContent != nil && *bifrostResp.Item.ResponsesReasoning.EncryptedContent != "" {
 								contentBlock.Type = AnthropicContentBlockTypeRedactedThinking
-								data := encrypted
-								if embedID {
-									data = providerUtils.EmbedReasoningItemID(bifrostResp.Item.ID, data)
-								}
-								contentBlock.Data = &data
-							} else {
-								contentBlock.Type = AnthropicContentBlockTypeThinking
-								contentBlock.Thinking = schemas.Ptr("")
-								signature := ""
-								if embedID {
-									signature = providerUtils.EmbedReasoningItemID(bifrostResp.Item.ID, "")
-								}
-								contentBlock.Signature = &signature
+								contentBlock.Data = bifrostResp.Item.ResponsesReasoning.EncryptedContent
 							}
 						} else {
-							// A real function call. It always opens as tool_use: the
-							// input_json_delta events that follow are only legal against a
-							// tool_use block, so guessing "this first-position call is really
-							// thinking" whenever the response happened to carry reasoning
-							// stranded the call and aborted the client's turn. Reasoning
-							// genuinely misclassified as a function call is already caught by
-							// the ResponsesReasoning != nil branch above, which has the actual
-							// reasoning payload to go on rather than a positional guess.
-							contentBlock.Type = AnthropicContentBlockTypeToolUse
-							if bifrostResp.Item.ResponsesToolMessage != nil {
-								contentBlock.ID = providerUtils.SanitizeAnthropicToolUseIDPtr(bifrostResp.Item.ResponsesToolMessage.CallID)
-								contentBlock.Name = bifrostResp.Item.ResponsesToolMessage.Name
-								// Always start with empty input for streaming compatibility
-								contentBlock.Input = json.RawMessage("{}")
+							// Regular function call - check if ContentIndex is 0 and thinking might be enabled
+							// If ContentIndex is 0, we need to check if there's reasoning content in the response
+							contentIndex := 0
+							if bifrostResp.ContentIndex != nil {
+								contentIndex = *bifrostResp.ContentIndex
+							}
+							isFirstBlock := contentIndex == 0
 
-								// Track WebSearch tools so we can skip their argument deltas
-								// and regenerate them synthetically (with sanitization) at output_item.done
-								if bifrostResp.Item.ResponsesToolMessage.Name != nil &&
-									*bifrostResp.Item.ResponsesToolMessage.Name == "WebSearch" &&
-									bifrostResp.Item.ID != nil {
-									streamState := getOrCreateAnthropicToResponsesStreamState(ctx)
-									if streamState.webSearchItemIDs == nil {
-										streamState.webSearchItemIDs = make(map[string]bool)
+							// Check if response has reasoning content (indicating thinking is enabled)
+							hasReasoningInResponse := false
+							if bifrostResp.Response != nil && bifrostResp.Response.Output != nil {
+								for _, msg := range bifrostResp.Response.Output {
+									if msg.Type != nil && *msg.Type == schemas.ResponsesMessageTypeReasoning {
+										hasReasoningInResponse = true
+										break
 									}
-									streamState.webSearchItemIDs[*bifrostResp.Item.ID] = true
+								}
+							}
+
+							// When thinking is enabled and this is the first block, use thinking/redacted_thinking
+							if isFirstBlock && hasReasoningInResponse {
+								contentBlock.Type = AnthropicContentBlockTypeThinking
+								contentBlock.Thinking = schemas.Ptr("")
+								contentBlock.Signature = schemas.Ptr("")
+							} else {
+								contentBlock.Type = AnthropicContentBlockTypeToolUse
+								if bifrostResp.Item.ResponsesToolMessage != nil {
+									contentBlock.ID = bifrostResp.Item.ResponsesToolMessage.CallID
+									contentBlock.Name = bifrostResp.Item.ResponsesToolMessage.Name
+									// Always start with empty input for streaming compatibility
+									contentBlock.Input = json.RawMessage("{}")
+
+									// Track WebSearch tools so we can skip their argument deltas
+									// and regenerate them synthetically (with sanitization) at output_item.done
+									if bifrostResp.Item.ResponsesToolMessage.Name != nil &&
+										*bifrostResp.Item.ResponsesToolMessage.Name == "WebSearch" &&
+										bifrostResp.Item.ID != nil {
+										streamState := getOrCreateAnthropicToResponsesStreamState(ctx)
+										if streamState.webSearchItemIDs == nil {
+											streamState.webSearchItemIDs = make(map[string]bool)
+										}
+										streamState.webSearchItemIDs[*bifrostResp.Item.ID] = true
+									}
 								}
 							}
 						}
 					case schemas.ResponsesMessageTypeMCPCall:
 						contentBlock.Type = AnthropicContentBlockTypeMCPToolUse
 						if bifrostResp.Item.ResponsesToolMessage != nil {
-							contentBlock.ID = providerUtils.SanitizeAnthropicToolUseIDPtr(bifrostResp.Item.ID)
+							contentBlock.ID = bifrostResp.Item.ID
 							contentBlock.Name = bifrostResp.Item.ResponsesToolMessage.Name
 							if bifrostResp.Item.ResponsesToolMessage.ResponsesMCPToolCall != nil {
 								contentBlock.ServerName = &bifrostResp.Item.ResponsesToolMessage.ResponsesMCPToolCall.ServerLabel
@@ -3065,9 +1714,15 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 		if isCompactionItem(bifrostResp.Item) {
 			block := bifrostResp.Item.Content.ContentBlocks[0]
 			if block.ResponsesOutputMessageContentCompaction != nil {
+				var indexToUse *int
+				if bifrostResp.OutputIndex != nil {
+					indexToUse = bifrostResp.OutputIndex
+				} else if bifrostResp.ContentIndex != nil {
+					indexToUse = bifrostResp.ContentIndex
+				}
 				events = append(events, &AnthropicStreamEvent{
 					Type:  AnthropicStreamEventTypeContentBlockDelta,
-					Index: blockIdx,
+					Index: indexToUse,
 					Delta: &AnthropicStreamDelta{
 						Type:    AnthropicStreamDeltaTypeCompaction,
 						Content: &block.ResponsesOutputMessageContentCompaction.Summary,
@@ -3102,8 +1757,14 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 				}
 			}
 			if shouldGenerateDeltas && argumentsJSON != "" {
-				// Generate synthetic input_json_delta events by chunking the JSON.
-				deltaEvents := generateSyntheticInputJSONDeltas(argumentsJSON, blockIdx)
+				// Generate synthetic input_json_delta events by chunking the JSON
+				var indexToUse *int
+				if bifrostResp.OutputIndex != nil {
+					indexToUse = bifrostResp.OutputIndex
+				} else if bifrostResp.ContentIndex != nil {
+					indexToUse = bifrostResp.ContentIndex
+				}
+				deltaEvents := generateSyntheticInputJSONDeltas(argumentsJSON, indexToUse)
 				events = append(events, deltaEvents...)
 			}
 		}
@@ -3114,7 +1775,13 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 
 	case schemas.ResponsesStreamResponseTypeOutputTextDelta:
 		streamResp.Type = AnthropicStreamEventTypeContentBlockDelta
-		streamResp.Index = getOrCreateAnthropicToResponsesStreamState(ctx).blockIndexFor(reverseStreamItemKey(bifrostResp))
+		// Use OutputIndex instead of ContentIndex for global Anthropic indexing
+		if bifrostResp.OutputIndex != nil {
+			streamResp.Index = bifrostResp.OutputIndex
+		} else if bifrostResp.ContentIndex != nil {
+			// Fallback to ContentIndex if OutputIndex not available
+			streamResp.Index = bifrostResp.ContentIndex
+		}
 		if bifrostResp.Delta != nil {
 			streamResp.Delta = &AnthropicStreamDelta{
 				Type: AnthropicStreamDeltaTypeText,
@@ -3132,7 +1799,12 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 		}
 
 		streamResp.Type = AnthropicStreamEventTypeContentBlockDelta
-		streamResp.Index = getOrCreateAnthropicToResponsesStreamState(ctx).blockIndexFor(reverseStreamItemKey(bifrostResp))
+		// Use OutputIndex for global Anthropic indexing
+		if bifrostResp.OutputIndex != nil {
+			streamResp.Index = bifrostResp.OutputIndex
+		} else if bifrostResp.ContentIndex != nil {
+			streamResp.Index = bifrostResp.ContentIndex
+		}
 		if bifrostResp.Arguments != nil {
 			streamResp.Delta = &AnthropicStreamDelta{
 				Type:        AnthropicStreamDeltaTypeInputJSON,
@@ -3148,7 +1820,12 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 
 	case schemas.ResponsesStreamResponseTypeReasoningSummaryTextDelta:
 		streamResp.Type = AnthropicStreamEventTypeContentBlockDelta
-		streamResp.Index = getOrCreateAnthropicToResponsesStreamState(ctx).blockIndexFor(reverseStreamItemKey(bifrostResp))
+		// Use OutputIndex for global Anthropic indexing
+		if bifrostResp.OutputIndex != nil {
+			streamResp.Index = bifrostResp.OutputIndex
+		} else if bifrostResp.ContentIndex != nil {
+			streamResp.Index = bifrostResp.ContentIndex
+		}
 
 		// Check if this is a signature delta or text delta
 		if bifrostResp.Signature != nil {
@@ -3169,7 +1846,11 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 		// Convert OpenAI annotation to Anthropic citation
 		if bifrostResp.Annotation != nil {
 			streamResp.Type = AnthropicStreamEventTypeContentBlockDelta
-			streamResp.Index = getOrCreateAnthropicToResponsesStreamState(ctx).blockIndexFor(reverseStreamItemKey(bifrostResp))
+			if bifrostResp.OutputIndex != nil {
+				streamResp.Index = bifrostResp.OutputIndex
+			} else if bifrostResp.ContentIndex != nil {
+				streamResp.Index = bifrostResp.ContentIndex
+			}
 
 			citation := convertAnnotationToAnthropicCitation(*bifrostResp.Annotation)
 
@@ -3199,7 +1880,14 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 			// This replaces the delta events that were skipped earlier
 			var events []*AnthropicStreamEvent
 
-			indexToUse := getOrCreateAnthropicToResponsesStreamState(ctx).blockIndexFor(reverseStreamItemKey(bifrostResp))
+			// Use OutputIndex for proper Anthropic indexing, fallback to ContentIndex
+			var indexToUse *int
+			if bifrostResp.OutputIndex != nil {
+				indexToUse = bifrostResp.OutputIndex
+			} else if bifrostResp.ContentIndex != nil {
+				indexToUse = bifrostResp.ContentIndex
+			}
+
 			deltaEvents := generateSyntheticInputJSONDeltas(argumentsJSON, indexToUse)
 			events = append(events, deltaEvents...)
 
@@ -3226,7 +1914,13 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 			// Computer tool complete - emit content_block_delta with the action, then stop
 			// Note: We're sending the complete action JSON in one delta
 			streamResp.Type = AnthropicStreamEventTypeContentBlockDelta
-			streamResp.Index = getOrCreateAnthropicToResponsesStreamState(ctx).blockIndexFor(reverseStreamItemKey(bifrostResp))
+
+			// Use OutputIndex for global Anthropic indexing
+			if bifrostResp.OutputIndex != nil {
+				streamResp.Index = bifrostResp.OutputIndex
+			} else if bifrostResp.ContentIndex != nil {
+				streamResp.Index = bifrostResp.ContentIndex
+			}
 
 			// Convert the action to Anthropic format and marshal to JSON
 			if bifrostResp.Item.ResponsesToolMessage != nil &&
@@ -3246,41 +1940,71 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 					}
 				}
 			}
-			return []*AnthropicStreamEvent{
-				streamResp,
-				{
-					Type:  AnthropicStreamEventTypeContentBlockStop,
-					Index: streamResp.Index,
-				},
-			}
 		} else if bifrostResp.Item != nil &&
 			bifrostResp.Item.Type != nil &&
 			*bifrostResp.Item.Type == schemas.ResponsesMessageTypeWebSearchCall {
 
 			// Web search call complete - generate synthetic input_json_delta events, then emit content_block_stop
 			var events []*AnthropicStreamEvent
-			state := getOrCreateAnthropicToResponsesStreamState(ctx)
-			serverIdx := state.blockIndexFor(reverseStreamItemKey(bifrostResp))
 
-			tm := bifrostResp.Item.ResponsesToolMessage
-			wsAction := (*schemas.ResponsesWebSearchToolCallAction)(nil)
-			if tm != nil && tm.Action != nil {
-				wsAction = tm.Action.ResponsesWebSearchToolCallAction
+			// Extract query from web search action for synthetic delta generation
+			var queryJSON string
+			if bifrostResp.Item.ResponsesToolMessage != nil &&
+				bifrostResp.Item.ResponsesToolMessage.Action != nil &&
+				bifrostResp.Item.ResponsesToolMessage.Action.ResponsesWebSearchToolCallAction != nil &&
+				bifrostResp.Item.ResponsesToolMessage.Action.ResponsesWebSearchToolCallAction.Query != nil {
+
+				// Create input map with query
+				inputMap := map[string]interface{}{
+					"query": *bifrostResp.Item.ResponsesToolMessage.Action.ResponsesWebSearchToolCallAction.Query,
+				}
+				if jsonBytes, err := providerUtils.MarshalSorted(inputMap); err == nil {
+					queryJSON = string(jsonBytes)
+				}
 			}
 
-			// 1. Stop the server_tool_use. The query was already delivered whole in
-			// content_block_start (no input_json_delta), matching native.
-			events = append(events, &AnthropicStreamEvent{
-				Type:  AnthropicStreamEventTypeContentBlockStop,
-				Index: serverIdx,
-			})
+			// Generate synthetic input_json_delta events if we have a query
+			if queryJSON != "" {
+				var indexToUse *int
+				if bifrostResp.OutputIndex != nil {
+					indexToUse = bifrostResp.OutputIndex
+				} else if bifrostResp.ContentIndex != nil {
+					indexToUse = bifrostResp.ContentIndex
+				}
+				deltaEvents := generateSyntheticInputJSONDeltas(queryJSON, indexToUse)
+				events = append(events, deltaEvents...)
+			}
 
-			// 2. Emit the paired web_search_tool_result block at a fresh index.
-			if wsAction != nil && len(wsAction.Sources) > 0 {
-				resultIndex := state.allocBlockIndex("")
+			// 1. Emit content_block_stop for the query block (server_tool_use)
+			stopEvent := &AnthropicStreamEvent{
+				Type: AnthropicStreamEventTypeContentBlockStop,
+			}
+			if bifrostResp.ContentIndex != nil {
+				stopEvent.Index = bifrostResp.ContentIndex
+			} else if bifrostResp.OutputIndex != nil {
+				stopEvent.Index = bifrostResp.OutputIndex
+			}
+			events = append(events, stopEvent)
 
+			// 2. Extract sources and create web_search_tool_result block if sources exist
+			if bifrostResp.Item.ResponsesToolMessage != nil &&
+				bifrostResp.Item.ResponsesToolMessage.Action != nil &&
+				bifrostResp.Item.ResponsesToolMessage.Action.ResponsesWebSearchToolCallAction != nil &&
+				len(bifrostResp.Item.ResponsesToolMessage.Action.ResponsesWebSearchToolCallAction.Sources) > 0 {
+
+				// Calculate next index for result block
+				var resultIndex *int
+				if bifrostResp.OutputIndex != nil {
+					nextIdx := *bifrostResp.OutputIndex + 1
+					resultIndex = &nextIdx
+				} else if bifrostResp.ContentIndex != nil {
+					nextIdx := *bifrostResp.ContentIndex + 1
+					resultIndex = &nextIdx
+				}
+
+				// Create content blocks for each source
 				var resultContentBlocks []AnthropicContentBlock
-				for _, source := range wsAction.Sources {
+				for _, source := range bifrostResp.Item.ResponsesToolMessage.Action.ResponsesWebSearchToolCallAction.Sources {
 					block := AnthropicContentBlock{
 						Type:             AnthropicContentBlockTypeWebSearchResult,
 						URL:              &source.URL,
@@ -3295,205 +2019,28 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 					resultContentBlocks = append(resultContentBlocks, block)
 				}
 
-				resultBlock := &AnthropicContentBlock{
-					Type:      AnthropicContentBlockTypeWebSearchToolResult,
-					ToolUseID: providerUtils.SanitizeAnthropicToolUseIDPtr(bifrostResp.Item.ID), // Link to the server_tool_use block
-					Content:   &AnthropicContent{ContentBlocks: resultContentBlocks},
-				}
-				// Carry the programmatic-tool-calling caller onto the result too.
-				if tm != nil && tm.Caller != nil {
-					resultBlock.Caller = &AnthropicToolCaller{
-						Type:   AnthropicToolCallerType(tm.Caller.Type),
-						ToolID: providerUtils.SanitizeAnthropicToolUseIDPtr(tm.Caller.ToolID),
-					}
-				}
-				events = append(events,
-					&AnthropicStreamEvent{Type: AnthropicStreamEventTypeContentBlockStart, Index: resultIndex, ContentBlock: resultBlock},
-					&AnthropicStreamEvent{Type: AnthropicStreamEventTypeContentBlockStop, Index: resultIndex},
-				)
-			} else if state.passthrough {
-				// A resultless or error web_search (no sources, max_uses_exceeded,
-				// web_search_tool_result_error, etc.) still consumed a content-block
-				// index upstream. On the passthrough path, later non-server-tool frames
-				// may be forwarded raw, so consume that hidden index to keep the
-				// converter's next allocated index in lockstep with upstream.
-				_ = state.allocBlockIndex("")
-			}
-
-			return events
-		} else if bifrostResp.Item != nil &&
-			bifrostResp.Item.Type != nil &&
-			*bifrostResp.Item.Type == schemas.ResponsesMessageTypeWebFetchCall {
-
-			// Web fetch call complete - close the server_tool_use block, then emit
-			// the paired web_fetch_tool_result block when present.
-			state := getOrCreateAnthropicToResponsesStreamState(ctx)
-			serverIdx := state.blockIndexFor(reverseStreamItemKey(bifrostResp))
-			events := []*AnthropicStreamEvent{{
-				Type:  AnthropicStreamEventTypeContentBlockStop,
-				Index: serverIdx,
-			}}
-			if blocks := convertBifrostWebFetchCallToAnthropicBlocks(bifrostResp.Item); len(blocks) > 1 {
-				resultIdx := state.allocBlockIndex("")
-				resultBlock := blocks[1]
-				events = append(events,
-					&AnthropicStreamEvent{Type: AnthropicStreamEventTypeContentBlockStart, Index: resultIdx, ContentBlock: &resultBlock},
-					&AnthropicStreamEvent{Type: AnthropicStreamEventTypeContentBlockStop, Index: resultIdx},
-				)
-			} else if state.passthrough {
-				// Older/partial replay items can lack the typed web_fetch result even
-				// though upstream consumed a result-block index. Keep later raw
-				// passthrough frames aligned with the converter's allocator.
-				_ = state.allocBlockIndex("")
-			}
-			return events
-		} else if bifrostResp.Item != nil &&
-			bifrostResp.Item.Type != nil &&
-			*bifrostResp.Item.Type == schemas.ResponsesMessageTypeCodeInterpreterCall {
-
-			// Code interpreter call complete.
-			var events []*AnthropicStreamEvent
-			blocks := convertBifrostCodeExecCallToAnthropicBlocks(bifrostResp.Item)
-			state := getOrCreateAnthropicToResponsesStreamState(ctx)
-
-			// For python/bash the server_tool_use block was already closed early on
-			// code.done. text_editor (and any item not closed there) is still open —
-			// close it now from the verbatim carry input, which carries its full
-			// multi-key payload (command/path/file_text/…) that Code can't.
-			if !state.codeExecServerClosedByItem[reverseStreamItemKey(bifrostResp)] {
-				serverIdx := state.blockIndexFor(reverseStreamItemKey(bifrostResp))
-				if len(blocks) > 0 && len(blocks[0].Input) > 0 {
-					events = append(events, generateSyntheticInputJSONDeltas(string(blocks[0].Input), serverIdx)...)
-				}
-				events = append(events, &AnthropicStreamEvent{
-					Type:  AnthropicStreamEventTypeContentBlockStop,
-					Index: serverIdx,
-				})
-			}
-
-			if len(blocks) > 1 {
-				resultIdx := state.allocBlockIndex("")
-				resultBlock := blocks[1]
-				events = append(events,
-					&AnthropicStreamEvent{
-						Type:         AnthropicStreamEventTypeContentBlockStart,
-						Index:        resultIdx,
-						ContentBlock: &resultBlock,
-					},
-					&AnthropicStreamEvent{
-						Type:  AnthropicStreamEventTypeContentBlockStop,
-						Index: resultIdx,
-					},
-				)
-			}
-
-			return events
-		} else if bifrostResp.Item != nil &&
-			bifrostResp.Item.Type != nil &&
-			*bifrostResp.Item.Type == schemas.ResponsesMessageTypeAdvisorCall {
-
-			// Advisor call complete - emit content_block_stop for the server_tool_use
-			// block, then the advisor_tool_result block (start + stop) at a fresh index.
-			var events []*AnthropicStreamEvent
-			state := getOrCreateAnthropicToResponsesStreamState(ctx)
-
-			toolUseID := bifrostResp.Item.ID
-			if bifrostResp.Item.ResponsesToolMessage != nil && bifrostResp.Item.ResponsesToolMessage.CallID != nil {
-				toolUseID = bifrostResp.Item.ResponsesToolMessage.CallID
-			}
-			toolUseID = providerUtils.SanitizeAnthropicToolUseIDPtr(toolUseID)
-
-			serverIdx := state.blockIndexFor(reverseStreamItemKey(bifrostResp))
-
-			// 1. content_block_stop for the server_tool_use block.
-			events = append(events, &AnthropicStreamEvent{
-				Type:  AnthropicStreamEventTypeContentBlockStop,
-				Index: serverIdx,
-			})
-
-			// 2. content_block_start for advisor_tool_result at a fresh index.
-			resultIdx := state.allocBlockIndex("")
-			resultBlock := &AnthropicContentBlock{
-				Type:      AnthropicContentBlockTypeAdvisorToolResult,
-				ToolUseID: toolUseID,
-			}
-			if bifrostResp.Item.ResponsesToolMessage != nil && bifrostResp.Item.ResponsesToolMessage.ResponsesAdvisorCall != nil {
-				adv := bifrostResp.Item.ResponsesToolMessage.ResponsesAdvisorCall
-				resultType := adv.ResultType
-				if resultType == "" {
-					resultType = "advisor_result"
-				}
-				resultBlock.Content = &AnthropicContent{
-					ContentObj: &AnthropicContentBlock{
-						Type:             AnthropicContentBlockType(resultType),
-						Text:             adv.Text,
-						EncryptedContent: adv.EncryptedContent,
-						ErrorCode:        adv.ErrorCode,
-						StopReason:       adv.StopReason,
-					},
-				}
-			}
-			events = append(events, &AnthropicStreamEvent{
-				Type:         AnthropicStreamEventTypeContentBlockStart,
-				Index:        resultIdx,
-				ContentBlock: resultBlock,
-			})
-
-			// 3. content_block_stop for the advisor_tool_result block.
-			events = append(events, &AnthropicStreamEvent{
-				Type:  AnthropicStreamEventTypeContentBlockStop,
-				Index: resultIdx,
-			})
-
-			return events
-		} else if isReasoningItem(bifrostResp.Item) {
-
-			// Reasoning complete. Close the block opened at output_item.added, then --
-			// when that block was a thinking block and the finished item carries an
-			// encrypted payload -- emit the payload as its own redacted_thinking block
-			// at a fresh index.
-			//
-			// Two shapes land here. An item that already held both halves at
-			// output_item.added opened as thinking so its summary deltas were legal,
-			// leaving the encrypted half to be emitted here. An incrementally streamed
-			// item had no payload at all at output_item.added and only accumulates it
-			// by the time it is done -- previously that payload never reached the
-			// client, so a replayed turn lost the reasoning state entirely.
-			//
-			// Splitting rather than flipping the block's type is what the non-streaming
-			// converter already does (convertBifrostReasoningToAnthropicThinking):
-			// redacted_thinking is atomic on the wire, carrying its payload in `data`
-			// on the start frame, which is why it never receives deltas.
-			state := getOrCreateAnthropicToResponsesStreamState(ctx)
-			idx := state.blockIndexFor(reverseStreamItemKey(bifrostResp))
-			events := []*AnthropicStreamEvent{{
-				Type:  AnthropicStreamEventTypeContentBlockStop,
-				Index: idx,
-			}}
-
-			encrypted, _ := reasoningPayloadAndSummary(bifrostResp.Item)
-			openedAsThinking := idx != nil && state.blockType(*idx) == AnthropicContentBlockTypeThinking
-			if encrypted != "" && openedAsThinking {
-				data := encrypted
-				if providerUtils.ShouldEmbedReasoningItemID(ctx, bifrostResp.ExtraFields.Provider, bifrostResp.ExtraFields.RoutingInfo.Model) {
-					data = providerUtils.EmbedReasoningItemID(bifrostResp.Item.ID, data)
-				}
-				redactedIdx := state.allocBlockIndex("")
-				events = append(events,
-					&AnthropicStreamEvent{
-						Type:  AnthropicStreamEventTypeContentBlockStart,
-						Index: redactedIdx,
-						ContentBlock: &AnthropicContentBlock{
-							Type: AnthropicContentBlockTypeRedactedThinking,
-							Data: &data,
+				// Emit content_block_start for web_search_tool_result
+				resultStartEvent := &AnthropicStreamEvent{
+					Type:  AnthropicStreamEventTypeContentBlockStart,
+					Index: resultIndex,
+					ContentBlock: &AnthropicContentBlock{
+						Type:      AnthropicContentBlockTypeWebSearchToolResult,
+						ToolUseID: bifrostResp.Item.ID, // Link to the server_tool_use block
+						Content: &AnthropicContent{
+							ContentBlocks: resultContentBlocks,
 						},
 					},
-					&AnthropicStreamEvent{
-						Type:  AnthropicStreamEventTypeContentBlockStop,
-						Index: redactedIdx,
-					},
-				)
+				}
+				events = append(events, resultStartEvent)
+
+				// Emit content_block_stop for the result block
+				resultStopEvent := &AnthropicStreamEvent{
+					Type:  AnthropicStreamEventTypeContentBlockStop,
+					Index: resultIndex,
+				}
+				events = append(events, resultStopEvent)
 			}
+
 			return events
 		} else if bifrostResp.Item != nil &&
 			bifrostResp.Item.Type != nil &&
@@ -3502,53 +2049,26 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 
 			// Function call or MCP call complete - just emit content_block_stop
 			streamResp.Type = AnthropicStreamEventTypeContentBlockStop
-			streamResp.Index = getOrCreateAnthropicToResponsesStreamState(ctx).blockIndexFor(reverseStreamItemKey(bifrostResp))
+			if bifrostResp.ContentIndex != nil {
+				streamResp.Index = bifrostResp.ContentIndex
+			} else if bifrostResp.OutputIndex != nil {
+				streamResp.Index = bifrostResp.OutputIndex
+			}
 		} else {
 			// For text blocks and other content blocks, emit content_block_stop
 			streamResp.Type = AnthropicStreamEventTypeContentBlockStop
-			streamResp.Index = getOrCreateAnthropicToResponsesStreamState(ctx).blockIndexFor(reverseStreamItemKey(bifrostResp))
+			// Use OutputIndex for global Anthropic indexing
+			if bifrostResp.OutputIndex != nil {
+				streamResp.Index = bifrostResp.OutputIndex
+			} else if bifrostResp.ContentIndex != nil {
+				streamResp.Index = bifrostResp.ContentIndex
+			}
 		}
 	case schemas.ResponsesStreamResponseTypeWebSearchCallInProgress,
 		schemas.ResponsesStreamResponseTypeWebSearchCallSearching,
 		schemas.ResponsesStreamResponseTypeWebSearchCallCompleted:
 		// Web search lifecycle events - these are OpenAI-style events that don't have Anthropic equivalents
 		// Skip them to avoid cluttering the stream
-		return nil
-
-	case schemas.ResponsesStreamResponseTypeCodeInterpreterCallCodeDone:
-		// Close the code server_tool_use block early — before any nested web_search
-		// blocks — only for python/bash, whose entire input reconstructs from the
-		// neutral Code (`{"code"|"command": …}`) and which can spawn nested blocks
-		// (programmatic tool calling), so sequential ordering requires the early
-		// close. text_editor has a multi-key input that Code can't carry (Code is
-		// empty) and never spawns nested blocks, so leave its block open and let
-		// output_item.done close it from the verbatim carry input.
-		if bifrostResp.Code == nil || *bifrostResp.Code == "" {
-			return nil
-		}
-		state := getOrCreateAnthropicToResponsesStreamState(ctx)
-		key := reverseStreamItemKey(bifrostResp)
-		idx := state.blockIndexFor(key)
-		inputKey := "code"
-		if AnthropicToolName(state.codeExecToolNameByItem[key]) == AnthropicToolNameBashCodeExecution {
-			inputKey = "command"
-		}
-		var events []*AnthropicStreamEvent
-		if inputBytes, err := providerUtils.MarshalSorted(map[string]interface{}{inputKey: *bifrostResp.Code}); err == nil {
-			events = append(events, generateSyntheticInputJSONDeltas(string(inputBytes), idx)...)
-		}
-		events = append(events, &AnthropicStreamEvent{Type: AnthropicStreamEventTypeContentBlockStop, Index: idx})
-		if state.codeExecServerClosedByItem == nil {
-			state.codeExecServerClosedByItem = make(map[string]bool)
-		}
-		state.codeExecServerClosedByItem[key] = true
-		return events
-
-	case schemas.ResponsesStreamResponseTypeCodeInterpreterCallInProgress,
-		schemas.ResponsesStreamResponseTypeCodeInterpreterCallCodeDelta,
-		schemas.ResponsesStreamResponseTypeCodeInterpreterCallInterpreting,
-		schemas.ResponsesStreamResponseTypeCodeInterpreterCallCompleted:
-		// Other code interpreter lifecycle events have no Anthropic equivalent.
 		return nil
 
 	case schemas.ResponsesStreamResponseTypePing:
@@ -3577,29 +2097,18 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 					StopSequence: nil,
 				}
 			}
-			if sd := stopDetailsToAnthropic(bifrostResp.Response.StopDetails); sd != nil {
-				if anthropicContentDeltaEvent.Delta == nil {
-					anthropicContentDeltaEvent.Delta = &AnthropicStreamDelta{}
-				}
-				anthropicContentDeltaEvent.Delta.StopDetails = sd
-			}
-			// Re-emit the code-execution sandbox container on the message_delta.
-			if bifrostResp.Response.Container != nil {
-				if anthropicContentDeltaEvent.Delta == nil {
-					anthropicContentDeltaEvent.Delta = &AnthropicStreamDelta{}
-				}
-				anthropicContentDeltaEvent.Delta.Container = &AnthropicResponseContainer{
-					ID:        bifrostResp.Response.Container.ID,
-					ExpiresAt: bifrostResp.Response.Container.ExpiresAt,
-				}
-			}
 		}
 		return []*AnthropicStreamEvent{anthropicContentDeltaEvent, streamResp}
 
 	case schemas.ResponsesStreamResponseTypeMCPCallArgumentsDelta:
 		// MCP call arguments delta - convert to content_block_delta with input_json
 		streamResp.Type = AnthropicStreamEventTypeContentBlockDelta
-		streamResp.Index = getOrCreateAnthropicToResponsesStreamState(ctx).blockIndexFor(reverseStreamItemKey(bifrostResp))
+		// Use OutputIndex for global Anthropic indexing
+		if bifrostResp.OutputIndex != nil {
+			streamResp.Index = bifrostResp.OutputIndex
+		} else if bifrostResp.ContentIndex != nil {
+			streamResp.Index = bifrostResp.ContentIndex
+		}
 		if bifrostResp.Delta != nil {
 			streamResp.Delta = &AnthropicStreamDelta{
 				Type:        AnthropicStreamDeltaTypeInputJSON,
@@ -3616,7 +2125,12 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 	case schemas.ResponsesStreamResponseTypeMCPCallCompleted:
 		// MCP call completed - emit content_block_stop
 		streamResp.Type = AnthropicStreamEventTypeContentBlockStop
-		streamResp.Index = getOrCreateAnthropicToResponsesStreamState(ctx).blockIndexFor(reverseStreamItemKey(bifrostResp))
+		// Use OutputIndex for global Anthropic indexing
+		if bifrostResp.OutputIndex != nil {
+			streamResp.Index = bifrostResp.OutputIndex
+		} else if bifrostResp.ContentIndex != nil {
+			streamResp.Index = bifrostResp.ContentIndex
+		}
 
 	case schemas.ResponsesStreamResponseTypeMCPCallFailed:
 		// MCP call failed - emit error event
@@ -3652,26 +2166,6 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 					Text: bifrostResp.Delta,
 				}
 			}
-			if bifrostResp.Response != nil {
-				if sd := stopDetailsToAnthropic(bifrostResp.Response.StopDetails); sd != nil {
-					if streamResp.Delta == nil {
-						streamResp.Delta = &AnthropicStreamDelta{}
-					}
-					streamResp.Delta.StopDetails = sd
-				}
-			}
-
-			// Re-emit the code-execution sandbox container on message_delta (read
-			// straight off the event — Anthropic delivers it here natively).
-			if bifrostResp.Response != nil && bifrostResp.Response.Container != nil {
-				if streamResp.Delta == nil {
-					streamResp.Delta = &AnthropicStreamDelta{}
-				}
-				streamResp.Delta.Container = &AnthropicResponseContainer{
-					ID:        bifrostResp.Response.Container.ID,
-					ExpiresAt: bifrostResp.Response.Container.ExpiresAt,
-				}
-			}
 		}
 
 	case schemas.ResponsesStreamResponseTypeError:
@@ -3698,29 +2192,12 @@ func (req *AnthropicMessageRequest) ToBifrostResponsesRequest(ctx *schemas.Bifro
 	bifrostReq := &schemas.BifrostResponsesRequest{
 		Provider:  provider,
 		Model:     model,
-		Fallbacks: schemas.ParseFallbacks(req.bifrostFallbackModels()),
+		Fallbacks: schemas.ParseFallbacks(req.Fallbacks),
 	}
 
 	// Convert basic parameters
 	params := &schemas.ResponsesParameters{
 		ExtraParams: make(map[string]interface{}),
-	}
-
-	// Anthropic native server-side fallback ("fallbacks" objects) is forwarded to
-	// the provider verbatim, distinct from Bifrost cross-provider fallback above.
-	// The bare-string preset (fallbacks:"default", Opus 5 default routing) is
-	// forwarded the same way so the rebuild re-adds it and injects the -2026-07-01
-	// beta header; without this the preset is lost and Anthropic 400s the array-only
-	// wire form.
-	if native := req.nativeFallbacks(); len(native) > 0 {
-		params.ExtraParams["fallbacks"] = native
-	} else if req.Fallbacks != nil && req.Fallbacks.Preset != "" {
-		params.ExtraParams["fallbacks"] = req.Fallbacks.Preset
-	}
-
-	// Fallback credit token — carried verbatim so the retry can redeem it.
-	if req.FallbackCreditToken != nil {
-		params.ExtraParams["fallback_credit_token"] = *req.FallbackCreditToken
 	}
 
 	if req.MaxTokens > 0 {
@@ -3752,9 +2229,6 @@ func (req *AnthropicMessageRequest) ToBifrostResponsesRequest(ctx *schemas.Bifro
 	if req.CacheControl != nil {
 		params.ExtraParams["cache_control"] = req.CacheControl
 	}
-	if req.Diagnostics != nil {
-		params.ExtraParams["diagnostics"] = req.Diagnostics
-	}
 	if req.TopK != nil {
 		params.ExtraParams["top_k"] = *req.TopK
 	}
@@ -3772,15 +2246,6 @@ func (req *AnthropicMessageRequest) ToBifrostResponsesRequest(ctx *schemas.Bifro
 	}
 	if req.OutputConfig != nil && req.OutputConfig.TaskBudget != nil {
 		params.ExtraParams["task_budget"] = req.OutputConfig.TaskBudget
-	}
-	// output_config.effort is independent of thinking. Anthropic's effort docs are
-	// explicit -- "It doesn't require thinking to be enabled" and "Effort works with
-	// or without thinking" -- and effort "affects all tokens in the response",
-	// including text and tool calls, so it stays meaningful even with thinking off.
-	// Record it before the thinking branch below, which can only express it as part
-	// of a reasoning configuration.
-	if req.OutputConfig != nil && req.OutputConfig.Effort != nil {
-		setAnthropicNativeEffort(ctx, *req.OutputConfig.Effort, req.Thinking == nil)
 	}
 	if req.Thinking != nil {
 		if req.Thinking.Type == "enabled" || req.Thinking.Type == "adaptive" {
@@ -3824,36 +2289,9 @@ func (req *AnthropicMessageRequest) ToBifrostResponsesRequest(ctx *schemas.Bifro
 				Effort: schemas.Ptr("none"),
 			}
 		}
-	} else if req.OutputConfig != nil && req.OutputConfig.Effort != nil {
-		// Effort with no thinking parameter. The neutral request carries the effort
-		// so non-Anthropic providers still honour it (they have no equivalent of the
-		// "omitted" state and treat an effort as reasoning-on); the Anthropic egress
-		// reads the recorded native intent instead and leaves thinking untouched.
-		params.Reasoning = &schemas.ResponsesParametersReasoning{
-			Effort: schemas.Ptr(*req.OutputConfig.Effort),
-		}
 	}
 	if include, ok := schemas.SafeExtractStringSlice(req.ExtraParams["include"]); ok {
 		params.Include = include
-	}
-	// Lift the mixed server/client tool opt-in onto the typed parameter: the
-	// Gemini declaration-drop gate reads Params.IncludeServerSideToolInvocations,
-	// so leaving it in ExtraParams silently drops function tools when a request
-	// combines them with a server-side tool (issue #5679). Unregistered fields
-	// are captured as json.RawMessage holding the bare true/false token, so a
-	// string comparison is enough.
-	if raw, exists := req.ExtraParams["include_server_side_tool_invocations"]; exists {
-		switch v := raw.(type) {
-		case bool:
-			params.IncludeServerSideToolInvocations = schemas.Ptr(v)
-		case json.RawMessage:
-			switch strings.TrimSpace(string(v)) {
-			case "true":
-				params.IncludeServerSideToolInvocations = schemas.Ptr(true)
-			case "false":
-				params.IncludeServerSideToolInvocations = schemas.Ptr(false)
-			}
-		}
 	}
 	if req.ServiceTier != nil {
 		mapped := MapAnthropicRequestServiceTierToBifrost(*req.ServiceTier)
@@ -3959,9 +2397,6 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 		MaxTokens: providerUtils.GetMaxOutputTokensOrDefault(bifrostReq.Model, AnthropicDefaultMaxTokens),
 	}
 
-	// capModel is the canonical model string used only for capability/version
-	capModel := schemas.ResolveCanonicalModel(ctx, bifrostReq.Model)
-
 	// Convert basic parameters
 	if bifrostReq.Params != nil {
 		if bifrostReq.Params.MaxOutputTokens != nil {
@@ -3969,7 +2404,7 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 		}
 		// Opus 4.7+ and the Fable/Mythos family reject temperature, top_p, and
 		// top_k with a 400 error.
-		if !IsAdaptiveOnlyThinkingModel(capModel) {
+		if !IsAdaptiveOnlyThinkingModel(bifrostReq.Model) {
 			// Anthropic doesn't allow both temperature and top_p to be specified.
 			// If both are present, prefer temperature (more commonly used).
 			if bifrostReq.Params.Temperature != nil {
@@ -3984,14 +2419,10 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 			}
 		}
 		if bifrostReq.Params.Text != nil {
-			// Vertex, Bedrock Mantle, and Azure don't accept native structured outputs
-			// (output_config.format), so convert to a tool instead.
-			if bifrostReq.Provider == schemas.Vertex || bifrostReq.Provider == schemas.BedrockMantle || bifrostReq.Provider == schemas.Azure {
+			// Vertex doesn't support native structured outputs, so convert to tool
+			if bifrostReq.Provider == schemas.Vertex {
 				if bifrostReq.Params.Text.Format != nil {
-					responseFormatTool, err := convertResponsesTextFormatToTool(ctx, bifrostReq.Params.Text)
-					if err != nil {
-						return nil, err
-					}
+					responseFormatTool := convertResponsesTextFormatToTool(ctx, bifrostReq.Params.Text)
 					if responseFormatTool != nil {
 						if anthropicReq.Tools == nil {
 							anthropicReq.Tools = []AnthropicTool{}
@@ -4044,7 +2475,7 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 		}
 		if bifrostReq.Params.Reasoning != nil {
 			if bifrostReq.Params.Reasoning.MaxTokens != nil {
-				if IsAdaptiveOnlyThinkingModel(capModel) {
+				if IsAdaptiveOnlyThinkingModel(bifrostReq.Model) {
 					// Opus 4.7+ and Fable/Mythos: budget_tokens removed; adaptive thinking is the only thinking-on mode.
 					anthropicReq.Thinking = &AnthropicThinking{Type: "adaptive"}
 					// Preserve a co-present effort — these models support
@@ -4060,37 +2491,28 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 						budgetTokens = MinimumReasoningMaxTokens
 					}
 					if budgetTokens < MinimumReasoningMaxTokens {
-						return nil, fmt.Errorf("reasoning.max_tokens must be >= %d for anthropic: %w", MinimumReasoningMaxTokens, ErrReasoningMaxTokensTooLow)
+						return nil, fmt.Errorf("reasoning.max_tokens must be >= %d for anthropic", MinimumReasoningMaxTokens)
 					}
 					anthropicReq.Thinking = &AnthropicThinking{
 						Type:         "enabled",
 						BudgetTokens: schemas.Ptr(budgetTokens),
 					}
 				}
-			} else if native, ok := anthropicNativeEffortFrom(ctx); ok && native.ThinkingOmitted {
-				// The caller sent output_config.effort and no thinking parameter.
-				// Forward exactly that: the effort alone, with thinking left absent so
-				// the model applies its own default. Synthesizing thinking here would
-				// turn it on against the caller's request on every model that defaults
-				// it off (Opus 4.6/4.7/4.8, Sonnet 4.6).
-				if SupportsEffortParameter(capModel) {
-					setEffortOnOutputConfig(anthropicReq, MapBifrostEffortToAnthropic(native.Effort))
-				}
 			} else {
 				if bifrostReq.Params.Reasoning.Effort != nil {
 					if *bifrostReq.Params.Reasoning.Effort != "none" {
 						effort := MapBifrostEffortToAnthropic(*bifrostReq.Params.Reasoning.Effort)
 
-						if SupportsAdaptiveThinking(capModel) {
+						if SupportsAdaptiveThinking(bifrostReq.Model) {
 							// Opus 4.6+ and Opus 4.7+: adaptive thinking + native effort
 							anthropicReq.Thinking = &AnthropicThinking{Type: "adaptive"}
 							setEffortOnOutputConfig(anthropicReq, effort)
-						} else if SupportsNativeEffort(capModel) {
+						} else if SupportsNativeEffort(bifrostReq.Model) {
 							// Opus 4.5: native effort + budget_tokens thinking
 							setEffortOnOutputConfig(anthropicReq, effort)
 							budgetTokens, err := providerUtils.GetBudgetTokensFromReasoningEffort(effort, MinimumReasoningMaxTokens, anthropicReq.MaxTokens)
 							if err != nil {
-								return nil, fmt.Errorf("%w: %w", ErrReasoningMaxTokensTooLow, err)
+								return nil, err
 							}
 							anthropicReq.Thinking = &AnthropicThinking{
 								Type:         "enabled",
@@ -4100,31 +2522,20 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 							// Older models: budget_tokens only
 							budgetTokens, err := providerUtils.GetBudgetTokensFromReasoningEffort(effort, MinimumReasoningMaxTokens, anthropicReq.MaxTokens)
 							if err != nil {
-								return nil, fmt.Errorf("%w: %w", ErrReasoningMaxTokensTooLow, err)
+								return nil, err
 							}
 							anthropicReq.Thinking = &AnthropicThinking{
 								Type:         "enabled",
 								BudgetTokens: schemas.Ptr(budgetTokens),
 							}
 						}
-					} else {
-						if !IsFableFamily(capModel) {
-							// Fable/Mythos reject thinking:{type:"disabled"} with a 400 —
-							// adaptive thinking is always on and cannot be disabled. Omit
-							// the thinking param entirely for that family; all other
-							// models take the explicit disabled path.
-							anthropicReq.Thinking = &AnthropicThinking{
-								Type: "disabled",
-							}
-						}
-						// Thinking off does not mean effort off: effort "affects all
-						// tokens in the response", tool calls and text included, and
-						// Opus 5 accepts thinking:{disabled} at effort high or below.
-						// The neutral params collapsed the caller's effort into "none"
-						// to signal reasoning-off, so restore it from what they sent.
-						if native, ok := anthropicNativeEffortFrom(ctx); ok && native.Effort != "" &&
-							SupportsEffortParameter(capModel) {
-							setEffortOnOutputConfig(anthropicReq, MapBifrostEffortToAnthropic(native.Effort))
+					} else if !IsFableFamily(bifrostReq.Model) {
+						// Fable/Mythos reject thinking:{type:"disabled"} with a 400 —
+						// adaptive thinking is always on and cannot be disabled. Omit
+						// the thinking param entirely for that family; all other
+						// models take the explicit disabled path.
+						anthropicReq.Thinking = &AnthropicThinking{
+							Type: "disabled",
 						}
 					}
 				}
@@ -4137,7 +2548,7 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 					} else {
 						anthropicReq.Thinking.Display = schemas.Ptr("summarized")
 					}
-				} else if IsAdaptiveOnlyThinkingModel(capModel) {
+				} else if IsAdaptiveOnlyThinkingModel(bifrostReq.Model) {
 					anthropicReq.Thinking.Display = schemas.Ptr("summarized")
 				}
 			}
@@ -4149,8 +2560,10 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 		}
 
 		if bifrostReq.Params.ExtraParams != nil {
-			anthropicReq.ExtraParams = make(map[string]any, len(bifrostReq.Params.ExtraParams))
-			maps.Copy(anthropicReq.ExtraParams, bifrostReq.Params.ExtraParams)
+			anthropicReq.ExtraParams = make(map[string]interface{}, len(bifrostReq.Params.ExtraParams))
+			for k, v := range bifrostReq.Params.ExtraParams {
+				anthropicReq.ExtraParams[k] = v
+			}
 			if cacheControlRaw, exists := anthropicReq.ExtraParams["cache_control"]; exists {
 				parsed := false
 				switch v := cacheControlRaw.(type) {
@@ -4173,38 +2586,16 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 					delete(anthropicReq.ExtraParams, "cache_control")
 				}
 			}
-			if diagnosticsRaw, exists := anthropicReq.ExtraParams["diagnostics"]; exists {
-				parsed := false
-				switch v := diagnosticsRaw.(type) {
-				case *AnthropicDiagnostics:
-					anthropicReq.Diagnostics = v
-					parsed = true
-				case AnthropicDiagnostics:
-					anthropicReq.Diagnostics = &v
-					parsed = true
-				default:
-					if data, err := providerUtils.MarshalSorted(v); err == nil {
-						var d AnthropicDiagnostics
-						if sonic.Unmarshal(data, &d) == nil {
-							anthropicReq.Diagnostics = &d
-							parsed = true
-						}
-					}
-				}
-				if parsed {
-					delete(anthropicReq.ExtraParams, "diagnostics")
-				}
-			}
 			topK, ok := schemas.SafeExtractIntPointer(bifrostReq.Params.ExtraParams["top_k"])
 			if ok {
 				delete(anthropicReq.ExtraParams, "top_k")
-				if !IsAdaptiveOnlyThinkingModel(capModel) {
+				if !IsAdaptiveOnlyThinkingModel(bifrostReq.Model) {
 					anthropicReq.TopK = topK
 				}
 			}
 			if speed, ok := schemas.SafeExtractStringPointer(bifrostReq.Params.ExtraParams["speed"]); ok {
 				delete(anthropicReq.ExtraParams, "speed")
-				if SupportsFastMode(capModel) {
+				if SupportsFastMode(bifrostReq.Model) {
 					anthropicReq.Speed = speed
 				}
 			}
@@ -4215,6 +2606,18 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 			if inferenceGeo, ok := schemas.SafeExtractStringPointer(bifrostReq.Params.ExtraParams["inference_geo"]); ok {
 				delete(anthropicReq.ExtraParams, "inference_geo")
 				anthropicReq.InferenceGeo = inferenceGeo
+			}
+			if cmVal := bifrostReq.Params.ExtraParams["context_management"]; cmVal != nil {
+				if cm, ok := cmVal.(*ContextManagement); ok && cm != nil {
+					delete(anthropicReq.ExtraParams, "context_management")
+					anthropicReq.ContextManagement = cm
+				} else if data, err := providerUtils.MarshalSorted(cmVal); err == nil {
+					var cm ContextManagement
+					if sonic.Unmarshal(data, &cm) == nil {
+						delete(anthropicReq.ExtraParams, "context_management")
+						anthropicReq.ContextManagement = &cm
+					}
+				}
 			}
 			if tbVal, exists := bifrostReq.Params.ExtraParams["task_budget"]; exists {
 				// Always consume provider-specific key from passthrough extras.
@@ -4241,69 +2644,11 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 				}
 				anthropicReq.OutputConfig.TaskBudget = taskBudget
 			}
-			// Anthropic native server-side fallback: rebuild the typed field so it
-			// marshals as native "fallbacks" objects and drives beta-header injection.
-			if fbVal, exists := bifrostReq.Params.ExtraParams["fallbacks"]; exists {
-				delete(anthropicReq.ExtraParams, "fallbacks")
-				var natives []AnthropicNativeFallback
-				switch v := fbVal.(type) {
-				case string:
-					// fallbacks:"default" (Opus 5 default fallback routing) — promote onto
-					// the typed field so it marshals natively and drives the -07-01 header.
-					anthropicReq.Fallbacks = &AnthropicFallbacks{Preset: v}
-				case []AnthropicNativeFallback:
-					natives = v
-				default:
-					if data, err := providerUtils.MarshalSorted(v); err == nil {
-						_ = sonic.Unmarshal(data, &natives)
-					}
-				}
-				if len(natives) > 0 {
-					entries := make([]AnthropicFallbackEntry, len(natives))
-					for i := range natives {
-						n := natives[i]
-						entries[i] = AnthropicFallbackEntry{Native: &n}
-					}
-					anthropicReq.Fallbacks = &AnthropicFallbacks{Entries: entries}
-				}
-			}
-			// Fallback credit token: promote onto the typed field so it marshals
-			// top-level and drives beta-header injection.
-			if tokenVal, exists := bifrostReq.Params.ExtraParams["fallback_credit_token"]; exists {
-				delete(anthropicReq.ExtraParams, "fallback_credit_token")
-				if token, ok := tokenVal.(string); ok && token != "" {
-					anthropicReq.FallbackCreditToken = &token
-				}
-			}
-		}
-
-		extraContextManagement := bifrostReq.Params.ExtraParams["context_management"]
-		delete(anthropicReq.ExtraParams, "context_management")
-
-		if features, ok := ProviderFeatures[bifrostReq.Provider]; !ok || features.ContextManagementField {
-			if len(bifrostReq.Params.ContextManagement) > 0 {
-				var cm ContextManagement
-				if err := sonic.Unmarshal(bifrostReq.Params.ContextManagement, &cm); err == nil {
-					anthropicReq.ContextManagement = &cm
-				}
-			}
-			// Use the captured extra only when the neutral field didn't already
-			// produce a typed value.
-			if anthropicReq.ContextManagement == nil && extraContextManagement != nil {
-				if cm, ok := extraContextManagement.(*ContextManagement); ok && cm != nil {
-					anthropicReq.ContextManagement = cm
-				} else if data, err := providerUtils.MarshalSorted(extraContextManagement); err == nil {
-					var cm ContextManagement
-					if sonic.Unmarshal(data, &cm) == nil {
-						anthropicReq.ContextManagement = &cm
-					}
-				}
-			}
 		}
 
 		// Convert tools
 		if bifrostReq.Params.Tools != nil {
-			anthropicTools, mcpServers := convertBifrostToolsToAnthropic(capModel, bifrostReq.Params.Tools, bifrostReq.Provider)
+			anthropicTools, mcpServers := convertBifrostToolsToAnthropic(bifrostReq.Model, bifrostReq.Params.Tools, bifrostReq.Provider)
 			if len(anthropicTools) > 0 {
 				if anthropicReq.Tools == nil {
 					anthropicReq.Tools = anthropicTools
@@ -4323,17 +2668,10 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 				anthropicReq.ToolChoice = anthropicToolChoice
 			}
 		}
-
-		// DeepSeek rejects a forced tool_choice while thinking is on. Force thinking
-		// off when tool_choice pins a specific tool.
-		if bifrostReq.Provider == schemas.DeepSeek && anthropicReq.ToolChoice != nil &&
-			anthropicReq.ToolChoice.Type == "tool" {
-			anthropicReq.Thinking = &AnthropicThinking{Type: "disabled"}
-		}
 	}
 
 	if bifrostReq.Input != nil {
-		anthropicMessages, systemContent := ConvertBifrostMessagesToAnthropicMessages(ctx, bifrostReq.Input, true, bifrostReq.Provider, capModel)
+		anthropicMessages, systemContent := ConvertBifrostMessagesToAnthropicMessages(ctx, bifrostReq.Input, true, bifrostReq.Provider, bifrostReq.Model)
 
 		// Set system message if present
 		if systemContent != nil {
@@ -4355,10 +2693,6 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 		anthropicReq.Messages = anthropicMessages
 	}
 
-	// See the same call in ToAnthropicChatRequest: over the cap the provider rejects the request
-	// outright, so trim the earliest markers instead of failing.
-	clampAnthropicCacheBreakpoints(anthropicReq)
-
 	return anthropicReq, nil
 }
 
@@ -4371,7 +2705,6 @@ func ConvertAnthropicUsageToBifrostUsage(anthropicUsage *AnthropicUsage) *schema
 
 	bifrostUsage := &schemas.ResponsesResponseUsage{
 		Type:         anthropicUsage.Type,
-		Model:        anthropicUsage.Model,
 		InputTokens:  anthropicUsage.InputTokens,
 		OutputTokens: anthropicUsage.OutputTokens,
 		TotalTokens:  anthropicUsage.InputTokens + anthropicUsage.OutputTokens,
@@ -4411,15 +2744,6 @@ func ConvertAnthropicUsageToBifrostUsage(anthropicUsage *AnthropicUsage) *schema
 		bifrostUsage.OutputTokensDetails.NumSearchQueries = schemas.Ptr(anthropicUsage.ServerToolUse.WebSearchRequests)
 	}
 
-	// Extended-thinking token count. Already a subset of OutputTokens upstream, so it
-	// carries across unchanged and OutputTokens/TotalTokens are left alone.
-	if anthropicUsage.OutputTokensDetails != nil && anthropicUsage.OutputTokensDetails.ThinkingTokens > 0 {
-		if bifrostUsage.OutputTokensDetails == nil {
-			bifrostUsage.OutputTokensDetails = &schemas.ResponsesResponseOutputTokens{}
-		}
-		bifrostUsage.OutputTokensDetails.ReasoningTokens = anthropicUsage.OutputTokensDetails.ThinkingTokens
-	}
-
 	// Recursively convert iterations
 	if len(anthropicUsage.Iterations) > 0 {
 		bifrostUsage.Iterations = make([]schemas.ResponsesResponseUsage, len(anthropicUsage.Iterations))
@@ -4442,7 +2766,6 @@ func ConvertBifrostUsageToAnthropicUsage(bifrostUsage *schemas.ResponsesResponse
 
 	anthropicUsage := &AnthropicUsage{
 		Type:         bifrostUsage.Type,
-		Model:        bifrostUsage.Model,
 		InputTokens:  bifrostUsage.InputTokens,
 		OutputTokens: bifrostUsage.OutputTokens,
 	}
@@ -4472,15 +2795,6 @@ func ConvertBifrostUsageToAnthropicUsage(bifrostUsage *schemas.ResponsesResponse
 		}
 	}
 
-	// Reasoning tokens map back to Anthropic's thinking-token breakdown. Unlike the
-	// cache counters above, OutputTokens is not adjusted: thinking tokens are already
-	// inside it on both sides.
-	if bifrostUsage.OutputTokensDetails != nil && bifrostUsage.OutputTokensDetails.ReasoningTokens > 0 {
-		anthropicUsage.OutputTokensDetails = &AnthropicOutputTokensDetails{
-			ThinkingTokens: bifrostUsage.OutputTokensDetails.ReasoningTokens,
-		}
-	}
-
 	// Recursively convert iterations
 	if len(bifrostUsage.Iterations) > 0 {
 		anthropicUsage.Iterations = make([]AnthropicUsage, len(bifrostUsage.Iterations))
@@ -4492,36 +2806,6 @@ func ConvertBifrostUsageToAnthropicUsage(bifrostUsage *schemas.ResponsesResponse
 	}
 
 	return anthropicUsage
-}
-
-// stopDetailsToBifrost converts Anthropic stop_details to the neutral form (nil-safe).
-func stopDetailsToBifrost(d *AnthropicStopDetails) *schemas.ResponsesStopDetails {
-	if d == nil {
-		return nil
-	}
-	return &schemas.ResponsesStopDetails{
-		Type:                    d.Type,
-		Category:                d.Category,
-		Explanation:             d.Explanation,
-		RecommendedModel:        d.RecommendedModel,
-		FallbackCreditToken:     d.FallbackCreditToken,
-		FallbackHasPrefillClaim: d.FallbackHasPrefillClaim,
-	}
-}
-
-// stopDetailsToAnthropic converts neutral stop_details back to Anthropic form (nil-safe).
-func stopDetailsToAnthropic(d *schemas.ResponsesStopDetails) *AnthropicStopDetails {
-	if d == nil {
-		return nil
-	}
-	return &AnthropicStopDetails{
-		Type:                    d.Type,
-		Category:                d.Category,
-		Explanation:             d.Explanation,
-		RecommendedModel:        d.RecommendedModel,
-		FallbackCreditToken:     d.FallbackCreditToken,
-		FallbackHasPrefillClaim: d.FallbackHasPrefillClaim,
-	}
 }
 
 // ToBifrostResponsesResponse converts an Anthropic response to BifrostResponse with Responses structure
@@ -4539,10 +2823,6 @@ func (response *AnthropicMessageResponse) ToBifrostResponsesResponse(ctx *schema
 	// Convert usage information using common converter (handles iterations recursively)
 	bifrostResp.Usage = ConvertAnthropicUsageToBifrostUsage(response.Usage)
 
-	// Record the model that actually served the turn when server-side fallback
-	// handed off mid-request. Routing cannot see this, so pricing reads it here.
-	bifrostResp.ExtraFields.RoutingInfo.ServerSideFallbackModel = response.Usage.ServerSideFallbackModel()
-
 	// Convert content to Responses output messages using the new conversion method
 	if len(response.Content) > 0 {
 		// Create a temporary message to use the conversion method
@@ -4554,26 +2834,6 @@ func (response *AnthropicMessageResponse) ToBifrostResponsesResponse(ctx *schema
 		}
 		outputMessages := ConvertAnthropicMessagesToBifrostMessages(ctx, []AnthropicMessage{tempMsg}, nil, true, false)
 		if len(outputMessages) > 0 {
-			// Lift the response-level code-execution container onto every
-			// code_interpreter_call so it round-trips (id is neutral; expiry is carried).
-			if response.Container != nil {
-				for i := range outputMessages {
-					m := &outputMessages[i]
-					if m.Type == nil || *m.Type != schemas.ResponsesMessageTypeCodeInterpreterCall || m.ResponsesToolMessage == nil {
-						continue
-					}
-					if m.ResponsesToolMessage.ResponsesCodeInterpreterToolCall == nil {
-						m.ResponsesToolMessage.ResponsesCodeInterpreterToolCall = &schemas.ResponsesCodeInterpreterToolCall{}
-					}
-					m.ResponsesToolMessage.ResponsesCodeInterpreterToolCall.ContainerID = response.Container.ID
-					if response.Container.ExpiresAt != nil {
-						if m.ResponsesToolMessage.ResponsesCodeExecutionCall == nil {
-							m.ResponsesToolMessage.ResponsesCodeExecutionCall = &schemas.ResponsesCodeExecutionCall{}
-						}
-						m.ResponsesToolMessage.ResponsesCodeExecutionCall.ContainerExpiresAt = response.Container.ExpiresAt
-					}
-				}
-			}
 			bifrostResp.Output = outputMessages
 		}
 	}
@@ -4600,7 +2860,6 @@ func (response *AnthropicMessageResponse) ToBifrostResponsesResponse(ctx *schema
 		}
 		bifrostResp.StopReason = &mapped
 	}
-	bifrostResp.StopDetails = stopDetailsToBifrost(response.StopDetails)
 
 	if response.Usage != nil && response.Usage.ServiceTier != nil {
 		mapped := MapAnthropicServiceTierToBifrost(*response.Usage.ServiceTier)
@@ -4610,16 +2869,6 @@ func (response *AnthropicMessageResponse) ToBifrostResponsesResponse(ctx *schema
 	// Forward the speed actually served (fast mode) — drives fast-mode billing.
 	if response.Usage != nil && response.Usage.Speed != nil {
 		bifrostResp.Speed = response.Usage.Speed
-	}
-
-	// Forward the inference geography served — drives the data-residency multiplier.
-	if response.Usage != nil && response.Usage.InferenceGeo != nil {
-		bifrostResp.InferenceGeo = response.Usage.InferenceGeo
-	}
-
-	// Forward cache diagnostics (cache-diagnosis-2026-04-07) to the client.
-	if response.Diagnostics != nil {
-		bifrostResp.Diagnostics = response.Diagnostics
 	}
 
 	return bifrostResp
@@ -4641,7 +2890,7 @@ func ToAnthropicResponsesResponse(ctx *schemas.BifrostContext, bifrostResp *sche
 	// Convert output messages to Anthropic content blocks using the new conversion method
 	var contentBlocks []AnthropicContentBlock
 	if bifrostResp.Output != nil {
-		anthropicMessages, _ := ConvertBifrostMessagesToAnthropicMessages(ctx, bifrostResp.Output, false, bifrostResp.ExtraFields.Provider, bifrostResp.Model)
+		anthropicMessages, _ := ConvertBifrostMessagesToAnthropicMessages(ctx, bifrostResp.Output, false, "", "")
 		// Extract content blocks from the converted messages
 		for _, msg := range anthropicMessages {
 			if msg.Content.ContentBlocks != nil {
@@ -4661,25 +2910,6 @@ func ToAnthropicResponsesResponse(ctx *schemas.BifrostContext, bifrostResp *sche
 		anthropicResp.Content = []AnthropicContentBlock{}
 	}
 
-	// Restore the response-level code-execution container from the first
-	// code_interpreter_call that carries one.
-	for i := range bifrostResp.Output {
-		m := &bifrostResp.Output[i]
-		if m.Type == nil || *m.Type != schemas.ResponsesMessageTypeCodeInterpreterCall || m.ResponsesToolMessage == nil {
-			continue
-		}
-		ci := m.ResponsesToolMessage.ResponsesCodeInterpreterToolCall
-		if ci == nil || ci.ContainerID == "" {
-			continue
-		}
-		container := &AnthropicResponseContainer{ID: ci.ContainerID}
-		if cec := m.ResponsesToolMessage.ResponsesCodeExecutionCall; cec != nil {
-			container.ExpiresAt = cec.ContainerExpiresAt
-		}
-		anthropicResp.Container = container
-		break
-	}
-
 	// Map stop reason from Bifrost response if available, otherwise infer from content
 	if bifrostResp.StopReason != nil {
 		anthropicResp.StopReason = ConvertBifrostFinishReasonToAnthropic(*bifrostResp.StopReason)
@@ -4692,7 +2922,6 @@ func ToAnthropicResponsesResponse(ctx *schemas.BifrostContext, bifrostResp *sche
 			}
 		}
 	}
-	anthropicResp.StopDetails = stopDetailsToAnthropic(bifrostResp.StopDetails)
 
 	anthropicResp.Model = bifrostResp.Model
 
@@ -4709,10 +2938,6 @@ func ToAnthropicResponsesResponse(ctx *schemas.BifrostContext, bifrostResp *sche
 			anthropicResp.Usage = &AnthropicUsage{}
 		}
 		anthropicResp.Usage.Speed = bifrostResp.Speed
-	}
-
-	if bifrostResp.Diagnostics != nil {
-		anthropicResp.Diagnostics = bifrostResp.Diagnostics
 	}
 
 	return anthropicResp
@@ -4769,13 +2994,6 @@ func ConvertBifrostMessagesToAnthropicMessages(ctx *schemas.BifrostContext, bifr
 	// role:"system" in the messages array when the provider+model supports it.
 	seenConversation := false
 	midConvSystemSupported := isRequestMessage && SupportsMidConversationSystem(provider, model)
-	// When the native role:"system" form isn't available, inline the reminder as a user turn
-	// rather than hoisting it into the top-level system block — hoisting preserves the
-	// breakpoint but invalidates the cached prefix behind it, costing roughly half the prompt on
-	// a warm conversation. Gated on the Anthropic model family because these call sites also
-	// serve DeepSeek/Fireworks/SGL over the Anthropic wire shape, and the <system-reminder>
-	// envelope is a Claude convention those models never asked for; they keep hoisting.
-	inlineMidConvSystem := isRequestMessage && schemas.IsAnthropicModelFamily(ctx, model)
 
 	var anthropicMessages []AnthropicMessage
 	var systemContent *AnthropicContent
@@ -4800,29 +3018,6 @@ func ConvertBifrostMessagesToAnthropicMessages(ctx *schemas.BifrostContext, bifr
 	// previous_response_id pattern without its originating function_call) and must
 	// NOT be emitted as a tool_result, or Anthropic rejects the whole request.
 	knownToolUseIDs := make(map[string]bool)
-
-	// midConvPlacementOK reports whether a mid-conversation system message at input index i can
-	// legally be forwarded as role:"system". Anthropic enforces two clauses and rejects a
-	// violation of either with "messages.N: role 'system' must follow a 'user' message ...":
-	// the turn must FOLLOW a user message (or an assistant message ending in server-tool use),
-	// and it must be either the last entry or be followed by an assistant turn.
-	//
-	// The check is deliberately conservative — it looks at what has actually been emitted rather
-	// than trying to predict how the remaining input items will map to output messages, and it
-	// does not attempt to recognize the assistant-ending-in-server-tool-use exception. A
-	// false negative costs nothing: the caller falls back to inlining, which is cache-preserving
-	// and always accepted. A false positive would be a 400.
-	midConvPlacementOK := func(i int) bool {
-		if len(anthropicMessages) == 0 ||
-			anthropicMessages[len(anthropicMessages)-1].Role != AnthropicMessageRoleUser {
-			return false
-		}
-		if i == len(bifrostMessages)-1 {
-			return true
-		}
-		next := bifrostMessages[i+1]
-		return next.Role != nil && *next.Role == schemas.ResponsesInputMessageRoleAssistant
-	}
 
 	// Helper to emit orphaned tool results (no matching tool_use) as a single user
 	// text message so their content is preserved without violating Anthropic's
@@ -4996,22 +3191,13 @@ func ConvertBifrostMessagesToAnthropicMessages(ctx *schemas.BifrostContext, bifr
 					seenConversation = true
 				}
 				if content := convertBifrostMessageToAnthropicSystemContent(&msg); content != nil {
-					switch {
-					case seenConversation && midConvSystemSupported && midConvPlacementOK(i):
+					if seenConversation && midConvSystemSupported {
 						// Mid-conversation system message — emit as role:"system" in messages array.
 						anthropicMessages = append(anthropicMessages, AnthropicMessage{
 							Role:    AnthropicMessageRoleSystem,
 							Content: *content,
 						})
-					case seenConversation && inlineMidConvSystem:
-						// Native form unavailable (unsupported model, or a placement Anthropic
-						// rejects). Inline in place so the cache anchor stays inside `messages`
-						// instead of collapsing the prefix from the system block.
-						if inlined := inlineMidConversationSystem(content); inlined != nil {
-							anthropicMessages = append(anthropicMessages, *inlined)
-						}
-					default:
-						// Leading system run, or a non-Anthropic model: hoist (historical behavior).
+					} else {
 						systemContent = appendToSystemContent(systemContent, *content)
 					}
 				}
@@ -5054,7 +3240,7 @@ func ConvertBifrostMessagesToAnthropicMessages(ctx *schemas.BifrostContext, bifr
 			flushPendingToolResults()
 
 			// Handle reasoning as thinking content
-			reasoningBlocks := convertBifrostReasoningToAnthropicThinking(ctx, &msg, provider, model)
+			reasoningBlocks := convertBifrostReasoningToAnthropicThinking(&msg)
 			pendingReasoningContentBlocks = append(pendingReasoningContentBlocks, reasoningBlocks...)
 
 		case schemas.ResponsesMessageTypeFunctionCall:
@@ -5298,111 +3484,50 @@ func ConvertBifrostMessagesToAnthropicMessages(ctx *schemas.BifrostContext, bifr
 				}
 			}
 
-		case schemas.ResponsesMessageTypeAdvisorCall:
-			// Advisor calls, like web search, emit a server_tool_use + result
-			// pair that lives inside the assistant message.
-			flushPendingToolResults()
-			advisorBlocks := convertBifrostAdvisorCallToAnthropicBlocks(&msg)
-			if len(advisorBlocks) > 0 {
-				if currentAssistantMessage == nil {
-					currentAssistantMessage = &AnthropicMessage{
-						Role: AnthropicMessageRoleAssistant,
-					}
-				}
-				if len(pendingReasoningContentBlocks) > 0 {
-					copied := make([]AnthropicContentBlock, len(pendingReasoningContentBlocks))
-					copy(copied, pendingReasoningContentBlocks)
-					pendingToolCalls = append(copied, pendingToolCalls...)
-					pendingReasoningContentBlocks = nil
-				}
-				pendingToolCalls = append(pendingToolCalls, advisorBlocks...)
-				if advisorBlocks[0].ID != nil {
-					if currentToolCallIDs == nil {
-						currentToolCallIDs = make(map[string]bool)
-					}
-					currentToolCallIDs[*advisorBlocks[0].ID] = true
-				}
-			}
-
-		case schemas.ResponsesMessageTypeToolSearchCall:
-			// tool_search calls, like web search/advisor, emit a server_tool_use +
-			// result pair (carrying the discovered tool_references) that lives inside
-			// the assistant message, so a follow-up turn keeps the search context.
-			flushPendingToolResults()
-			toolSearchBlocks := convertBifrostToolSearchCallToAnthropicBlocks(&msg)
-			if len(toolSearchBlocks) > 0 {
-				if currentAssistantMessage == nil {
-					currentAssistantMessage = &AnthropicMessage{
-						Role: AnthropicMessageRoleAssistant,
-					}
-				}
-				if len(pendingReasoningContentBlocks) > 0 {
-					copied := make([]AnthropicContentBlock, len(pendingReasoningContentBlocks))
-					copy(copied, pendingReasoningContentBlocks)
-					pendingToolCalls = append(copied, pendingToolCalls...)
-					pendingReasoningContentBlocks = nil
-				}
-				pendingToolCalls = append(pendingToolCalls, toolSearchBlocks...)
-				if toolSearchBlocks[0].ID != nil {
-					if currentToolCallIDs == nil {
-						currentToolCallIDs = make(map[string]bool)
-					}
-					currentToolCallIDs[*toolSearchBlocks[0].ID] = true
-				}
-			}
-
-		case schemas.ResponsesMessageTypeCodeInterpreterCall:
-			// Code execution calls, like web search/advisor, emit a server_tool_use +
-			// *_code_execution_tool_result pair inside the assistant message.
-			flushPendingToolResults()
-			codeExecBlocks := convertBifrostCodeExecCallToAnthropicBlocks(&msg)
-			if len(codeExecBlocks) > 0 {
-				if currentAssistantMessage == nil {
-					currentAssistantMessage = &AnthropicMessage{
-						Role: AnthropicMessageRoleAssistant,
-					}
-				}
-				if len(pendingReasoningContentBlocks) > 0 {
-					copied := make([]AnthropicContentBlock, len(pendingReasoningContentBlocks))
-					copy(copied, pendingReasoningContentBlocks)
-					pendingToolCalls = append(copied, pendingToolCalls...)
-					pendingReasoningContentBlocks = nil
-				}
-				pendingToolCalls = append(pendingToolCalls, codeExecBlocks...)
-				if codeExecBlocks[0].ID != nil {
-					if currentToolCallIDs == nil {
-						currentToolCallIDs = make(map[string]bool)
-					}
-					currentToolCallIDs[*codeExecBlocks[0].ID] = true
-				}
-			}
-
 		case schemas.ResponsesMessageTypeWebFetchCall:
 			flushPendingToolResults()
-			webFetchBlocks := convertBifrostWebFetchCallToAnthropicBlocks(&msg)
-			if len(webFetchBlocks) > 0 {
-				if currentAssistantMessage == nil {
-					currentAssistantMessage = &AnthropicMessage{
-						Role: AnthropicMessageRoleAssistant,
-					}
+
+			if currentAssistantMessage == nil {
+				currentAssistantMessage = &AnthropicMessage{
+					Role: AnthropicMessageRoleAssistant,
 				}
-				if len(pendingReasoningContentBlocks) > 0 {
-					copied := make([]AnthropicContentBlock, len(pendingReasoningContentBlocks))
-					copy(copied, pendingReasoningContentBlocks)
-					pendingToolCalls = append(copied, pendingToolCalls...)
-					pendingReasoningContentBlocks = nil
+			}
+
+			if len(pendingReasoningContentBlocks) > 0 {
+				copied := make([]AnthropicContentBlock, len(pendingReasoningContentBlocks))
+				copy(copied, pendingReasoningContentBlocks)
+				pendingToolCalls = append(copied, pendingToolCalls...)
+				pendingReasoningContentBlocks = nil
+			}
+
+			serverToolUseBlock := AnthropicContentBlock{
+				Type: AnthropicContentBlockTypeServerToolUse,
+				Name: schemas.Ptr(string(AnthropicToolNameWebFetch)),
+			}
+			if msg.ID != nil {
+				serverToolUseBlock.ID = msg.ID
+			}
+			if msg.ResponsesToolMessage != nil && msg.ResponsesToolMessage.Action != nil &&
+				msg.ResponsesToolMessage.Action.ResponsesWebFetchToolCallAction != nil {
+				inputBytes, err := providerUtils.MarshalSorted(map[string]interface{}{
+					"url": msg.ResponsesToolMessage.Action.ResponsesWebFetchToolCallAction.URL,
+				})
+				if err == nil {
+					serverToolUseBlock.Input = json.RawMessage(inputBytes)
 				}
-				pendingToolCalls = append(pendingToolCalls, webFetchBlocks...)
-				if webFetchBlocks[0].ID != nil {
-					if currentToolCallIDs == nil {
-						currentToolCallIDs = make(map[string]bool)
-					}
-					currentToolCallIDs[*webFetchBlocks[0].ID] = true
+			}
+			pendingToolCalls = append(pendingToolCalls, serverToolUseBlock)
+
+			if serverToolUseBlock.ID != nil {
+				if currentToolCallIDs == nil {
+					currentToolCallIDs = make(map[string]bool)
 				}
+				currentToolCallIDs[*serverToolUseBlock.ID] = true
 			}
 
 		// Handle other tool call types that are not natively supported by Anthropic
 		case schemas.ResponsesMessageTypeFileSearchCall,
+			schemas.ResponsesMessageTypeCodeInterpreterCall,
 			schemas.ResponsesMessageTypeLocalShellCall,
 			schemas.ResponsesMessageTypeCustomToolCall,
 			schemas.ResponsesMessageTypeImageGenerationCall:
@@ -5561,13 +3686,6 @@ func convertAnthropicContentBlocksToResponsesMessagesGrouped(contentBlocks []Ant
 	var bifrostMessages []schemas.ResponsesMessage
 	var accumulatedTextContent []schemas.ResponsesMessageContentBlock
 	var pendingToolUseBlocks []*AnthropicContentBlock // Accumulate tool_use blocks
-	// reasoningIndexByID maps a recovered OpenAI reasoning item id to the index
-	// of the message already appended for it in bifrostMessages. A thinking
-	// block and its paired redacted_thinking block carry the same embedded id
-	// (egress always emits the thinking block first), so a later
-	// redacted_thinking with a matching id merges into that message instead of
-	// appending a second one with a duplicate id.
-	reasoningIndexByID := map[string]int{}
 
 	// Process content blocks
 	for _, block := range contentBlocks {
@@ -5639,88 +3757,37 @@ func convertAnthropicContentBlocksToResponsesMessagesGrouped(contentBlocks []Ant
 				bifrostMessages = append(bifrostMessages, bifrostMsg)
 			}
 
-		case AnthropicContentBlockTypeContainerUpload:
-			if block.FileID != nil {
-				bifrostMsg := schemas.ResponsesMessage{
-					Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
-					Role: role,
-					Content: &schemas.ResponsesMessageContent{
-						ContentBlocks: []schemas.ResponsesMessageContentBlock{block.toBifrostResponsesContainerUploadBlock()},
-					},
-				}
-				if isOutputMessage {
-					bifrostMsg.ID = schemas.Ptr("msg_" + providerUtils.GetRandomString(50))
-				}
-				bifrostMessages = append(bifrostMessages, bifrostMsg)
-			}
-
 		case AnthropicContentBlockTypeThinking:
 			if block.Thinking != nil {
-				id := new("rs_" + providerUtils.GetRandomString(50))
-				var recoveredID *string
-				signature := block.Signature
-				if signature != nil {
-					if extractedID, rest, ok := providerUtils.ExtractReasoningItemID(*signature); ok {
-						id = extractedID
-						recoveredID = extractedID
-						signature = &rest
-					}
-				}
 				bifrostMsg := schemas.ResponsesMessage{
-					ID:   id,
-					Type: new(schemas.ResponsesMessageTypeReasoning),
+					ID:   schemas.Ptr("rs_" + providerUtils.GetRandomString(50)),
+					Type: schemas.Ptr(schemas.ResponsesMessageTypeReasoning),
 					Role: role,
 					Content: &schemas.ResponsesMessageContent{
 						ContentBlocks: []schemas.ResponsesMessageContentBlock{
 							{
 								Type:      schemas.ResponsesOutputMessageContentTypeReasoning,
 								Text:      block.Thinking,
-								Signature: signature,
+								Signature: block.Signature,
 							},
 						},
 					},
 				}
 				bifrostMessages = append(bifrostMessages, bifrostMsg)
-				if recoveredID != nil {
-					reasoningIndexByID[*recoveredID] = len(bifrostMessages) - 1
-				}
 			}
 
 		case AnthropicContentBlockTypeRedactedThinking:
 			// Handle redacted thinking (encrypted content)
 			if block.Data != nil {
-				encryptedContent := *block.Data
-				id := new("rs_" + providerUtils.GetRandomString(50))
-				var recoveredID *string
-				if extractedID, rest, ok := providerUtils.ExtractReasoningItemID(*block.Data); ok {
-					id = extractedID
-					recoveredID = extractedID
-					encryptedContent = rest
-				}
-				if recoveredID != nil {
-					if idx, found := reasoningIndexByID[*recoveredID]; found {
-						// Same OpenAI reasoning item as an already-emitted thinking
-						// message -- merge the encrypted half into it instead of
-						// appending a second message with a duplicate id.
-						bifrostMessages[idx].ResponsesReasoning = &schemas.ResponsesReasoning{
-							Summary:          []schemas.ResponsesReasoningSummary{},
-							EncryptedContent: &encryptedContent,
-						}
-						continue
-					}
-				}
 				bifrostMsg := schemas.ResponsesMessage{
-					ID:   id,
-					Type: new(schemas.ResponsesMessageTypeReasoning),
+					ID:   schemas.Ptr("rs_" + providerUtils.GetRandomString(50)),
+					Type: schemas.Ptr(schemas.ResponsesMessageTypeReasoning),
 					ResponsesReasoning: &schemas.ResponsesReasoning{
 						Summary:          []schemas.ResponsesReasoningSummary{},
-						EncryptedContent: &encryptedContent,
+						EncryptedContent: block.Data,
 					},
 				}
 				bifrostMessages = append(bifrostMessages, bifrostMsg)
-				if recoveredID != nil {
-					reasoningIndexByID[*recoveredID] = len(bifrostMessages) - 1
-				}
 			}
 
 		case AnthropicContentBlockTypeToolUse:
@@ -5769,19 +3836,11 @@ func convertAnthropicContentBlocksToResponsesMessagesGrouped(contentBlocks []Ant
 								if contentBlock.Source != nil && contentBlock.Source.SourceObj != nil {
 									toolMsgContentBlocks = append(toolMsgContentBlocks, contentBlock.toBifrostResponsesImageBlock())
 								}
-							case AnthropicContentBlockTypeDocument:
-								// A tool returning a PDF (Claude Code's Read tool, for one)
-								// nests a document block here. Dropping it leaves the
-								// function_call_output with an empty content array, which
-								// OpenAI rejects outright:
-								// "Missing required parameter: 'input[N].content[0]'".
-								if contentBlock.Source != nil && contentBlock.Source.SourceObj != nil {
-									toolMsgContentBlocks = append(toolMsgContentBlocks, contentBlock.toBifrostResponsesDocumentBlock())
-								}
 							}
 						}
 						bifrostMsg.ResponsesToolMessage.Output.ResponsesFunctionToolCallOutputBlocks = toolMsgContentBlocks
 					}
+
 					// Handle is_error from Anthropic
 					if block.IsError != nil && *block.IsError {
 						bifrostMsg.Status = schemas.Ptr("incomplete")
@@ -5898,16 +3957,6 @@ func convertAnthropicContentBlocksToResponsesMessagesGrouped(contentBlocks []Ant
 func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContext, contentBlocks []AnthropicContentBlock, role *schemas.ResponsesMessageRoleType, isOutputMessage bool, structuredOutputToolName string) []schemas.ResponsesMessage {
 	var bifrostMessages []schemas.ResponsesMessage
 	var reasoningContentBlocks []schemas.ResponsesMessageContentBlock
-	// reasoningItemID is the OpenAI-issued item id recovered from the first
-	// marked thinking-block signature seen in this turn, if any. It's used
-	// instead of a fresh random id when the buffered blocks are flushed below.
-	var reasoningItemID *string
-	// reasoningEncryptedContent is set when a redacted_thinking block's
-	// recovered id matches reasoningItemID -- the encrypted half of the same
-	// OpenAI reasoning item the buffered thinking blocks belong to -- so it
-	// gets folded into the single flushed reasoning message below instead of
-	// becoming an independent message with a duplicate id.
-	var reasoningEncryptedContent *string
 
 	// Process content blocks
 	for _, block := range contentBlocks {
@@ -5938,32 +3987,6 @@ func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContex
 				}
 				bifrostMessages = append(bifrostMessages, bifrostMsg)
 			}
-		case AnthropicContentBlockTypeFallback:
-			fallback := &schemas.ResponsesOutputMessageContentFallback{}
-			if block.From != nil {
-				fallback.FromModel = block.From.Model
-			}
-			if block.To != nil {
-				fallback.ToModel = block.To.Model
-			}
-			if block.Trigger != nil {
-				fallback.TriggerType = block.Trigger.Type
-				fallback.TriggerCategory = block.Trigger.Category
-			}
-			bifrostMessages = append(bifrostMessages, schemas.ResponsesMessage{
-				ID:     schemas.Ptr("fb_" + providerUtils.GetRandomString(50)),
-				Type:   schemas.Ptr(schemas.ResponsesMessageTypeMessage),
-				Role:   role,
-				Status: schemas.Ptr("completed"),
-				Content: &schemas.ResponsesMessageContent{
-					ContentBlocks: []schemas.ResponsesMessageContentBlock{
-						{
-							Type:                                  schemas.ResponsesOutputMessageContentTypeFallback,
-							ResponsesOutputMessageContentFallback: fallback,
-						},
-					},
-				},
-			})
 		case AnthropicContentBlockTypeText:
 			if block.Text != nil {
 				var bifrostMsg schemas.ResponsesMessage
@@ -6050,63 +4073,23 @@ func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContex
 				}
 				bifrostMessages = append(bifrostMessages, bifrostMsg)
 			}
-		case AnthropicContentBlockTypeContainerUpload:
-			if block.FileID != nil {
-				bifrostMsg := schemas.ResponsesMessage{
-					Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
-					Role: role,
-					Content: &schemas.ResponsesMessageContent{
-						ContentBlocks: []schemas.ResponsesMessageContentBlock{block.toBifrostResponsesContainerUploadBlock()},
-					},
-				}
-				if isOutputMessage {
-					bifrostMsg.ID = schemas.Ptr("msg_" + providerUtils.GetRandomString(50))
-				}
-				bifrostMessages = append(bifrostMessages, bifrostMsg)
-			}
 		case AnthropicContentBlockTypeThinking:
 			if block.Thinking != nil {
 				// Collect reasoning blocks to create a single reasoning message
-				signature := block.Signature
-				if signature != nil {
-					if id, rest, ok := providerUtils.ExtractReasoningItemID(*signature); ok {
-						if reasoningItemID == nil {
-							reasoningItemID = id
-						}
-						signature = &rest
-					}
-				}
 				reasoningContentBlocks = append(reasoningContentBlocks, schemas.ResponsesMessageContentBlock{
 					Type:      schemas.ResponsesOutputMessageContentTypeReasoning,
 					Text:      block.Thinking,
-					Signature: signature,
+					Signature: block.Signature,
 				})
 			}
 		case AnthropicContentBlockTypeRedactedThinking:
 			if block.Data != nil {
-				encryptedContent := *block.Data
-				var extractedID *string
-				if id, rest, ok := providerUtils.ExtractReasoningItemID(*block.Data); ok {
-					extractedID = id
-					encryptedContent = rest
-				}
-				if extractedID != nil && reasoningItemID != nil && *extractedID == *reasoningItemID {
-					// Same OpenAI reasoning item as the buffered thinking blocks --
-					// fold into the pending reasoning message at flush time instead
-					// of emitting an independent message with a duplicate id.
-					reasoningEncryptedContent = &encryptedContent
-					continue
-				}
-				id := extractedID
-				if id == nil {
-					id = new("rs_" + providerUtils.GetRandomString(50))
-				}
 				bifrostMsg := schemas.ResponsesMessage{
-					ID:   id,
-					Type: new(schemas.ResponsesMessageTypeReasoning),
+					ID:   schemas.Ptr("rs_" + providerUtils.GetRandomString(50)),
+					Type: schemas.Ptr(schemas.ResponsesMessageTypeReasoning),
 					ResponsesReasoning: &schemas.ResponsesReasoning{
 						Summary:          []schemas.ResponsesReasoningSummary{},
-						EncryptedContent: &encryptedContent,
+						EncryptedContent: block.Data,
 					},
 				}
 				bifrostMessages = append(bifrostMessages, bifrostMsg)
@@ -6214,19 +4197,11 @@ func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContex
 								if contentBlock.Source != nil && contentBlock.Source.SourceObj != nil {
 									toolMsgContentBlocks = append(toolMsgContentBlocks, contentBlock.toBifrostResponsesImageBlock())
 								}
-							case AnthropicContentBlockTypeDocument:
-								// A tool returning a PDF (Claude Code's Read tool, for one)
-								// nests a document block here. Dropping it leaves the
-								// function_call_output with an empty content array, which
-								// OpenAI rejects outright:
-								// "Missing required parameter: 'input[N].content[0]'".
-								if contentBlock.Source != nil && contentBlock.Source.SourceObj != nil {
-									toolMsgContentBlocks = append(toolMsgContentBlocks, contentBlock.toBifrostResponsesDocumentBlock())
-								}
 							}
 						}
 						bifrostMsg.ResponsesToolMessage.Output.ResponsesFunctionToolCallOutputBlocks = toolMsgContentBlocks
 					}
+
 					// Handle is_error from Anthropic
 					if block.IsError != nil && *block.IsError {
 						bifrostMsg.Status = schemas.Ptr("incomplete")
@@ -6243,15 +4218,6 @@ func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContex
 					Type:                 schemas.Ptr(schemas.ResponsesMessageTypeWebSearchCall),
 					Status:               schemas.Ptr("completed"),
 					ResponsesToolMessage: &schemas.ResponsesToolMessage{},
-				}
-
-				// Preserve the caller (set when this search was spawned from inside
-				// the code execution sandbox — programmatic tool calling).
-				if block.Caller != nil {
-					bifrostMsg.ResponsesToolMessage.Caller = &schemas.ResponsesToolCaller{
-						Type:   string(block.Caller.Type),
-						ToolID: block.Caller.ToolID,
-					}
 				}
 
 				// Extract query from input
@@ -6276,14 +4242,7 @@ func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContex
 				bifrostMsg := schemas.ResponsesMessage{
 					Type:                 schemas.Ptr(schemas.ResponsesMessageTypeWebFetchCall),
 					Status:               schemas.Ptr("completed"),
-					ResponsesToolMessage: &schemas.ResponsesToolMessage{CallID: block.ID},
-				}
-
-				if block.Caller != nil {
-					bifrostMsg.ResponsesToolMessage.Caller = &schemas.ResponsesToolCaller{
-						Type:   string(block.Caller.Type),
-						ToolID: block.Caller.ToolID,
-					}
+					ResponsesToolMessage: &schemas.ResponsesToolMessage{},
 				}
 
 				if block.Input != nil {
@@ -6300,68 +4259,6 @@ func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContex
 					bifrostMsg.ID = block.ID
 					bifrostMessages = append(bifrostMessages, bifrostMsg)
 				}
-			} else if block.Name != nil && *block.Name == string(AnthropicToolNameAdvisor) {
-				// advisor server_tool_use — the paired advisor_tool_result is
-				// attached onto this message when it is encountered below.
-				bifrostMsg := schemas.ResponsesMessage{
-					Type:   schemas.Ptr(schemas.ResponsesMessageTypeAdvisorCall),
-					ID:     block.ID,
-					Status: schemas.Ptr("completed"),
-					ResponsesToolMessage: &schemas.ResponsesToolMessage{
-						Name:   schemas.Ptr(string(AnthropicToolNameAdvisor)),
-						CallID: block.ID,
-					},
-				}
-				if isOutputMessage {
-					bifrostMessages = append(bifrostMessages, bifrostMsg)
-				}
-			} else if block.Name != nil && isAnthropicCodeExecutionToolName(*block.Name) {
-				// code_execution / bash_code_execution / text_editor_code_execution
-				// server_tool_use — the paired *_tool_result is attached below.
-				if isOutputMessage {
-					bifrostMessages = append(bifrostMessages, buildBifrostCodeExecutionCall(block))
-				}
-			}
-
-		case AnthropicContentBlockTypeCodeExecutionToolResult,
-			AnthropicContentBlockTypeBashCodeExecutionToolResult,
-			AnthropicContentBlockTypeTextEditorCodeExecutionToolResult:
-			// Fold the code-execution result onto the matching code_interpreter_call.
-			if block.ToolUseID != nil {
-				attachAnthropicCodeExecutionResult(bifrostMessages, *block.ToolUseID, block)
-			}
-
-		case AnthropicContentBlockTypeAdvisorToolResult:
-			// Attach the advisor result onto the matching advisor_call.
-			if block.ToolUseID != nil {
-				for i := len(bifrostMessages) - 1; i >= 0; i-- {
-					msg := &bifrostMessages[i]
-					if msg.Type == nil || *msg.Type != schemas.ResponsesMessageTypeAdvisorCall {
-						continue
-					}
-					if msg.ResponsesToolMessage == nil || msg.ResponsesToolMessage.CallID == nil ||
-						*msg.ResponsesToolMessage.CallID != *block.ToolUseID {
-						continue
-					}
-					advisor := &schemas.ResponsesAdvisorCall{}
-					// content is a single object on the wire (ContentObj); UnmarshalJSON
-					// wraps incoming objects into ContentBlocks, so accept either.
-					if c := block.Content; c != nil {
-						inner := c.ContentObj
-						if inner == nil && len(c.ContentBlocks) > 0 {
-							inner = &c.ContentBlocks[0]
-						}
-						if inner != nil {
-							advisor.ResultType = string(inner.Type)
-							advisor.Text = inner.Text
-							advisor.EncryptedContent = inner.EncryptedContent
-							advisor.ErrorCode = inner.ErrorCode
-							advisor.StopReason = inner.StopReason
-						}
-					}
-					msg.ResponsesToolMessage.ResponsesAdvisorCall = advisor
-					break
-				}
 			}
 
 		case AnthropicContentBlockTypeWebSearchToolResult:
@@ -6371,9 +4268,7 @@ func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContex
 			}
 
 		case AnthropicContentBlockTypeWebFetchToolResult:
-			if block.ToolUseID != nil {
-				attachAnthropicWebFetchResult(bifrostMessages, *block.ToolUseID, block)
-			}
+			// Web fetch results are handled server-side by Anthropic, skip
 
 		case AnthropicContentBlockTypeWebSearchToolResultError:
 			// Handle web search errors — find matching web_search_call and mark as failed
@@ -6459,16 +4354,11 @@ func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContex
 	// Handle reasoning blocks - prepend reasoning message if we collected any
 	// This ensures reasoning comes before any text/tool blocks (Bedrock compatibility)
 	if len(reasoningContentBlocks) > 0 {
-		id := reasoningItemID
-		if id == nil {
-			id = new("rs_" + providerUtils.GetRandomString(50))
-		}
 		reasoningMessage := schemas.ResponsesMessage{
-			ID:   id,
-			Type: new(schemas.ResponsesMessageTypeReasoning),
+			ID:   schemas.Ptr("rs_" + providerUtils.GetRandomString(50)),
+			Type: schemas.Ptr(schemas.ResponsesMessageTypeReasoning),
 			ResponsesReasoning: &schemas.ResponsesReasoning{
-				Summary:          []schemas.ResponsesReasoningSummary{},
-				EncryptedContent: reasoningEncryptedContent,
+				Summary: []schemas.ResponsesReasoningSummary{},
 			},
 			Content: &schemas.ResponsesMessageContent{
 				ContentBlocks: reasoningContentBlocks,
@@ -6567,83 +4457,33 @@ func convertBifrostMessageToAnthropicMessage(msg *schemas.ResponsesMessage, pend
 }
 
 // convertBifrostReasoningToAnthropicThinking converts a Bifrost reasoning message to Anthropic thinking blocks
-// convertBifrostReasoningToAnthropicThinking converts a Bifrost reasoning message
-// into Anthropic thinking/redacted_thinking blocks.
-//
-// sourceProvider/model gate whether the OpenAI-issued reasoning item id (msg.ID)
-// gets embedded into the signature/data field via providerUtils.EmbedReasoningItemID
-// (see providerUtils.ShouldEmbedReasoningItemID for exactly which provider/model
-// combinations need this). Anthropic's thinking/redacted_thinking blocks have no
-// id field, so without this the id is silently dropped here and, if the client
-// echoes the block back on a later turn, a fresh random id gets minted and paired
-// with the original (still real) encrypted_content -- a mismatch OpenAI rejects
-// with "Encrypted content item_id did not match the target item id."
-func convertBifrostReasoningToAnthropicThinking(ctx *schemas.BifrostContext, msg *schemas.ResponsesMessage, sourceProvider schemas.ModelProvider, model string) []AnthropicContentBlock {
+func convertBifrostReasoningToAnthropicThinking(msg *schemas.ResponsesMessage) []AnthropicContentBlock {
 	var thinkingBlocks []AnthropicContentBlock
-	embedID := providerUtils.ShouldEmbedReasoningItemID(ctx, sourceProvider, model)
 
-	// Track whether the content blocks actually yielded reasoning rather than
-	// branching on Content being non-nil. `ContentBlocks != nil` is true for an
-	// EMPTY but non-nil slice -- and for one holding only non-reasoning blocks --
-	// so an else-if here shadowed the carefully hardened fallback below and
-	// dropped the replayed reasoning without a word.
-	emittedFromContentBlocks := false
-	if msg.Content != nil {
+	if msg.Content != nil && msg.Content.ContentBlocks != nil {
 		for _, block := range msg.Content.ContentBlocks {
 			if block.Type == schemas.ResponsesOutputMessageContentTypeReasoning && block.Text != nil {
-				// signature is required by the Agent SDK; converted (non-Anthropic) reasoning
-				// has none, so default to empty rather than omitting the field.
-				signature := block.Signature
-				if signature == nil {
-					signature = schemas.Ptr("")
-				}
-				if embedID {
-					embedded := providerUtils.EmbedReasoningItemID(msg.ID, *signature)
-					signature = &embedded
-				}
 				thinkingBlock := AnthropicContentBlock{
 					Type:      AnthropicContentBlockTypeThinking,
 					Thinking:  block.Text,
-					Signature: signature,
+					Signature: block.Signature,
 				}
 				thinkingBlocks = append(thinkingBlocks, thinkingBlock)
-				emittedFromContentBlocks = true
 			}
 		}
-	}
-	if !emittedFromContentBlocks && msg.ResponsesReasoning != nil {
-		// Redacted-only reasoning items carry an EMPTY (non-nil) summary list next
-		// to encrypted_content, in both the streaming and non-streaming converters,
-		// so gate on the list having entries rather than on nil: a nil-check sends
-		// such items through the summary loop, emits nothing, and drops the
-		// encrypted payload from the replayed request.
-		//
-		// These are independent ifs, not if/else-if: OpenAI can return a reasoning
-		// item with both a visible summary AND encrypted_content together, and both
-		// must survive as separate Anthropic blocks rather than the encrypted half
-		// being silently dropped whenever a summary is present.
-		if len(msg.ResponsesReasoning.Summary) > 0 {
+	} else if msg.ResponsesReasoning != nil {
+		if msg.ResponsesReasoning.Summary != nil {
 			for _, reasoningContent := range msg.ResponsesReasoning.Summary {
-				signature := ""
-				if embedID {
-					signature = providerUtils.EmbedReasoningItemID(msg.ID, "")
-				}
 				thinkingBlock := AnthropicContentBlock{
-					Type:      AnthropicContentBlockTypeThinking,
-					Thinking:  &reasoningContent.Text,
-					Signature: &signature, // required by the Agent SDK; empty when there's nothing to embed
+					Type:     AnthropicContentBlockTypeThinking,
+					Thinking: &reasoningContent.Text,
 				}
 				thinkingBlocks = append(thinkingBlocks, thinkingBlock)
 			}
-		}
-		if msg.ResponsesReasoning.EncryptedContent != nil && *msg.ResponsesReasoning.EncryptedContent != "" {
-			data := *msg.ResponsesReasoning.EncryptedContent
-			if embedID {
-				data = providerUtils.EmbedReasoningItemID(msg.ID, data)
-			}
+		} else if msg.ResponsesReasoning.EncryptedContent != nil {
 			thinkingBlock := AnthropicContentBlock{
 				Type: AnthropicContentBlockTypeRedactedThinking,
-				Data: &data,
+				Data: msg.ResponsesReasoning.EncryptedContent,
 			}
 			thinkingBlocks = append(thinkingBlocks, thinkingBlock)
 		}
@@ -6661,7 +4501,7 @@ func convertBifrostFunctionCallToAnthropicToolUse(ctx *schemas.BifrostContext, m
 		}
 
 		if msg.ResponsesToolMessage.CallID != nil {
-			toolUseBlock.ID = providerUtils.SanitizeAnthropicToolUseIDPtr(msg.ResponsesToolMessage.CallID)
+			toolUseBlock.ID = msg.ResponsesToolMessage.CallID
 		}
 		if msg.ResponsesToolMessage.Name != nil {
 			toolUseBlock.Name = msg.ResponsesToolMessage.Name
@@ -6699,7 +4539,7 @@ func convertBifrostFunctionCallOutputToAnthropicToolResultBlock(msg *schemas.Res
 	if msg.ResponsesToolMessage != nil {
 		toolResultBlock := AnthropicContentBlock{
 			Type:         AnthropicContentBlockTypeToolResult,
-			ToolUseID:    providerUtils.SanitizeAnthropicToolUseIDPtr(msg.ResponsesToolMessage.CallID),
+			ToolUseID:    msg.ResponsesToolMessage.CallID,
 			CacheControl: msg.CacheControl,
 		}
 
@@ -6755,7 +4595,7 @@ func convertBifrostComputerCallOutputToAnthropicToolResultBlock(msg *schemas.Res
 	if msg.ResponsesToolMessage != nil && msg.ResponsesToolMessage.CallID != nil {
 		toolResultBlock := AnthropicContentBlock{
 			Type:      AnthropicContentBlockTypeToolResult,
-			ToolUseID: providerUtils.SanitizeAnthropicToolUseIDPtr(msg.ResponsesToolMessage.CallID),
+			ToolUseID: msg.ResponsesToolMessage.CallID,
 		}
 
 		// Handle output
@@ -6786,7 +4626,7 @@ func convertBifrostMCPCallOutputToAnthropicToolResultBlock(msg *schemas.Response
 	if msg.ResponsesToolMessage != nil && msg.ResponsesToolMessage.CallID != nil {
 		toolResultBlock := AnthropicContentBlock{
 			Type:      AnthropicContentBlockTypeMCPToolResult,
-			ToolUseID: providerUtils.SanitizeAnthropicToolUseIDPtr(msg.ResponsesToolMessage.CallID),
+			ToolUseID: msg.ResponsesToolMessage.CallID,
 		}
 
 		// Handle output
@@ -6841,7 +4681,7 @@ func convertBifrostComputerCallToAnthropicToolUse(msg *schemas.ResponsesMessage)
 			Name: schemas.Ptr(string(AnthropicToolNameComputer)),
 		}
 		if msg.ResponsesToolMessage.CallID != nil {
-			toolUseBlock.ID = providerUtils.SanitizeAnthropicToolUseIDPtr(msg.ResponsesToolMessage.CallID)
+			toolUseBlock.ID = msg.ResponsesToolMessage.CallID
 		}
 		if msg.ResponsesToolMessage.Name != nil {
 			toolUseBlock.Name = msg.ResponsesToolMessage.Name
@@ -6867,7 +4707,7 @@ func convertBifrostMCPCallToAnthropicToolUse(msg *schemas.ResponsesMessage) *Ant
 		}
 
 		if msg.ID != nil {
-			toolUseBlock.ID = providerUtils.SanitizeAnthropicToolUseIDPtr(msg.ID)
+			toolUseBlock.ID = msg.ID
 		}
 		toolUseBlock.Name = msg.ResponsesToolMessage.Name
 
@@ -6894,7 +4734,7 @@ func convertBifrostMCPCallToAnthropicToolUse(msg *schemas.ResponsesMessage) *Ant
 func convertBifrostMCPCallOutputToAnthropicMessage(msg *schemas.ResponsesMessage) *AnthropicMessage {
 	toolResultBlock := AnthropicContentBlock{
 		Type: AnthropicContentBlockTypeMCPToolResult,
-		ID:   providerUtils.SanitizeAnthropicToolUseIDPtr(msg.ResponsesToolMessage.CallID),
+		ID:   msg.ResponsesToolMessage.CallID,
 	}
 
 	if msg.ResponsesToolMessage.Output != nil {
@@ -6917,7 +4757,7 @@ func convertBifrostMCPApprovalToAnthropicToolUse(msg *schemas.ResponsesMessage) 
 		}
 
 		if msg.ID != nil {
-			toolUseBlock.ID = providerUtils.SanitizeAnthropicToolUseIDPtr(msg.ID)
+			toolUseBlock.ID = msg.ID
 		}
 		toolUseBlock.Name = msg.ResponsesToolMessage.Name
 
@@ -6949,22 +4789,14 @@ func convertBifrostWebSearchCallToAnthropicBlocks(msg *schemas.ResponsesMessage)
 	var blocks []AnthropicContentBlock
 	action := msg.ResponsesToolMessage.Action.ResponsesWebSearchToolCallAction
 
-	// The caller (set when this search was spawned from inside the code execution
-	// sandbox) must be re-emitted on both the server_tool_use and the result block.
-	var caller *AnthropicToolCaller
-	if c := msg.ResponsesToolMessage.Caller; c != nil {
-		caller = &AnthropicToolCaller{Type: AnthropicToolCallerType(c.Type), ToolID: providerUtils.SanitizeAnthropicToolUseIDPtr(c.ToolID)}
-	}
-
 	// 1. Create server_tool_use block for the web search
 	serverToolUseBlock := AnthropicContentBlock{
-		Type:   AnthropicContentBlockTypeServerToolUse,
-		Name:   schemas.Ptr("web_search"),
-		Caller: caller,
+		Type: AnthropicContentBlockTypeServerToolUse,
+		Name: schemas.Ptr("web_search"),
 	}
 
 	if msg.ID != nil {
-		serverToolUseBlock.ID = providerUtils.SanitizeAnthropicToolUseIDPtr(msg.ID)
+		serverToolUseBlock.ID = msg.ID
 	}
 
 	// Extract the query from the action
@@ -7005,11 +4837,9 @@ func convertBifrostWebSearchCallToAnthropicBlocks(msg *schemas.ResponsesMessage)
 	} else {
 		toolUseID = msg.ID
 	}
-	toolUseID = providerUtils.SanitizeAnthropicToolUseIDPtr(toolUseID)
 	webSearchResultBlock := AnthropicContentBlock{
 		Type:      AnthropicContentBlockTypeWebSearchToolResult,
 		ToolUseID: toolUseID,
-		Caller:    caller,
 		Content: &AnthropicContent{
 			ContentBlocks: resultBlocks,
 		},
@@ -7017,589 +4847,6 @@ func convertBifrostWebSearchCallToAnthropicBlocks(msg *schemas.ResponsesMessage)
 	blocks = append(blocks, webSearchResultBlock)
 
 	return blocks
-}
-
-func getAnthropicContentObject(content *AnthropicContent) *AnthropicContentBlock {
-	if content == nil {
-		return nil
-	}
-	if content.ContentObj != nil {
-		return content.ContentObj
-	}
-	if len(content.ContentBlocks) > 0 {
-		return &content.ContentBlocks[0]
-	}
-	return nil
-}
-
-func convertAnthropicWebFetchResultToBifrost(block *AnthropicContentBlock) *schemas.ResponsesWebFetchCall {
-	if block == nil {
-		return nil
-	}
-	result := &schemas.ResponsesWebFetchCall{}
-	inner := getAnthropicContentObject(block.Content)
-	if inner == nil {
-		return result
-	}
-
-	result.ResultType = string(inner.Type)
-	result.URL = inner.URL
-	result.RetrievedAt = inner.RetrievedAt
-	result.ErrorCode = inner.ErrorCode
-
-	doc := getAnthropicContentObject(inner.Content)
-	if doc != nil {
-		result.Document = &schemas.ResponsesWebFetchDocument{
-			Type:    string(doc.Type),
-			Text:    doc.Text,
-			Title:   doc.Title,
-			Context: doc.Context,
-		}
-		if doc.Citations != nil && doc.Citations.Config != nil {
-			result.Document.Citations = doc.Citations.Config
-		}
-		if doc.Source != nil && doc.Source.SourceObj != nil {
-			src := doc.Source.SourceObj
-			result.Document.Source = &schemas.ResponsesWebFetchSource{
-				Type:      src.Type,
-				MediaType: src.MediaType,
-				Data:      src.Data,
-				URL:       src.URL,
-				FileID:    src.FileID,
-			}
-		}
-	}
-
-	return result
-}
-
-func attachAnthropicWebFetchResult(messages []schemas.ResponsesMessage, toolUseID string, block AnthropicContentBlock) {
-	for i := len(messages) - 1; i >= 0; i-- {
-		msg := &messages[i]
-		if msg.Type == nil || *msg.Type != schemas.ResponsesMessageTypeWebFetchCall {
-			continue
-		}
-		if msg.ID == nil || *msg.ID != toolUseID {
-			continue
-		}
-		if msg.ResponsesToolMessage == nil {
-			msg.ResponsesToolMessage = &schemas.ResponsesToolMessage{}
-		}
-		msg.ResponsesToolMessage.CallID = &toolUseID
-		msg.ResponsesToolMessage.ResponsesWebFetchCall = convertAnthropicWebFetchResultToBifrost(&block)
-		break
-	}
-}
-
-func convertBifrostWebFetchCallToAnthropicBlocks(msg *schemas.ResponsesMessage) []AnthropicContentBlock {
-	if msg == nil || msg.ResponsesToolMessage == nil {
-		return nil
-	}
-	tm := msg.ResponsesToolMessage
-
-	var toolUseID *string
-	if tm.CallID != nil {
-		toolUseID = tm.CallID
-	} else {
-		toolUseID = msg.ID
-	}
-	toolUseID = providerUtils.SanitizeAnthropicToolUseIDPtr(toolUseID)
-
-	var caller *AnthropicToolCaller
-	if tm.Caller != nil {
-		caller = &AnthropicToolCaller{Type: AnthropicToolCallerType(tm.Caller.Type), ToolID: providerUtils.SanitizeAnthropicToolUseIDPtr(tm.Caller.ToolID)}
-	}
-
-	serverToolUseBlock := AnthropicContentBlock{
-		Type:   AnthropicContentBlockTypeServerToolUse,
-		ID:     toolUseID,
-		Name:   schemas.Ptr(string(AnthropicToolNameWebFetch)),
-		Caller: caller,
-		Input:  json.RawMessage("{}"),
-	}
-	if tm.Action != nil && tm.Action.ResponsesWebFetchToolCallAction != nil &&
-		tm.Action.ResponsesWebFetchToolCallAction.URL != "" {
-		if inputBytes, err := providerUtils.MarshalSorted(map[string]interface{}{"url": tm.Action.ResponsesWebFetchToolCallAction.URL}); err == nil {
-			serverToolUseBlock.Input = json.RawMessage(inputBytes)
-		}
-	}
-
-	blocks := []AnthropicContentBlock{serverToolUseBlock}
-	if tm.ResponsesWebFetchCall == nil {
-		return blocks
-	}
-
-	wf := tm.ResponsesWebFetchCall
-	resultType := wf.ResultType
-	if resultType == "" {
-		resultType = "web_fetch_result"
-	}
-	inner := AnthropicContentBlock{
-		Type:        AnthropicContentBlockType(resultType),
-		URL:         wf.URL,
-		RetrievedAt: wf.RetrievedAt,
-		ErrorCode:   wf.ErrorCode,
-	}
-	if wf.Document != nil {
-		doc := &AnthropicContentBlock{
-			Type:    AnthropicContentBlockType(wf.Document.Type),
-			Text:    wf.Document.Text,
-			Title:   wf.Document.Title,
-			Context: wf.Document.Context,
-		}
-		if doc.Type == "" {
-			doc.Type = AnthropicContentBlockTypeDocument
-		}
-		if wf.Document.Citations != nil {
-			doc.Citations = &AnthropicCitations{Config: wf.Document.Citations}
-		}
-		if wf.Document.Source != nil {
-			src := wf.Document.Source
-			doc.Source = &AnthropicBlockSource{SourceObj: &AnthropicSource{
-				Type:      src.Type,
-				MediaType: src.MediaType,
-				Data:      src.Data,
-				URL:       src.URL,
-				FileID:    src.FileID,
-			}}
-		}
-		inner.Content = &AnthropicContent{ContentObj: doc}
-	}
-
-	blocks = append(blocks, AnthropicContentBlock{
-		Type:      AnthropicContentBlockTypeWebFetchToolResult,
-		ToolUseID: toolUseID,
-		Caller:    caller,
-		Content:   &AnthropicContent{ContentObj: &inner},
-	})
-
-	return blocks
-}
-
-// convertBifrostAdvisorCallToAnthropicBlocks rebuilds the advisor server_tool_use
-// block and its paired advisor_tool_result block from a neutral advisor_call.
-// Anthropic requires both blocks to appear together in the assistant message.
-func convertBifrostAdvisorCallToAnthropicBlocks(msg *schemas.ResponsesMessage) []AnthropicContentBlock {
-	// Resolve the tool-use id (server_tool_use.id == advisor_tool_result.tool_use_id).
-	var toolUseID *string
-	if msg.ResponsesToolMessage != nil && msg.ResponsesToolMessage.CallID != nil {
-		toolUseID = msg.ResponsesToolMessage.CallID
-	} else {
-		toolUseID = msg.ID
-	}
-	toolUseID = providerUtils.SanitizeAnthropicToolUseIDPtr(toolUseID)
-
-	// 1. server_tool_use block — advisor input is always empty.
-	serverToolUseBlock := AnthropicContentBlock{
-		Type:  AnthropicContentBlockTypeServerToolUse,
-		ID:    toolUseID,
-		Name:  schemas.Ptr(string(AnthropicToolNameAdvisor)),
-		Input: json.RawMessage("{}"),
-	}
-
-	// 2. advisor_tool_result block carrying the advisor's result content.
-	resultBlock := AnthropicContentBlock{
-		Type:      AnthropicContentBlockTypeAdvisorToolResult,
-		ToolUseID: toolUseID,
-	}
-	if msg.ResponsesToolMessage != nil && msg.ResponsesToolMessage.ResponsesAdvisorCall != nil {
-		adv := msg.ResponsesToolMessage.ResponsesAdvisorCall
-		resultType := adv.ResultType
-		if resultType == "" {
-			resultType = "advisor_result"
-		}
-		resultBlock.Content = &AnthropicContent{
-			ContentObj: &AnthropicContentBlock{
-				Type:             AnthropicContentBlockType(resultType),
-				Text:             adv.Text,
-				EncryptedContent: adv.EncryptedContent,
-				ErrorCode:        adv.ErrorCode,
-				StopReason:       adv.StopReason,
-			},
-		}
-	}
-
-	return []AnthropicContentBlock{serverToolUseBlock, resultBlock}
-}
-
-// convertBifrostToolSearchCallToAnthropicBlocks rebuilds the tool_search
-// server_tool_use block and its paired tool_search_tool_result block (carrying
-// the discovered tool_references) from a neutral tool_search_call. Anthropic
-// requires the server_tool_use to be followed by its result block in the
-// assistant message, so a follow-up turn that references a discovered tool keeps
-// the search context. Mirrors convertBifrostWebSearchCall/AdvisorCall.
-func convertBifrostToolSearchCallToAnthropicBlocks(msg *schemas.ResponsesMessage) []AnthropicContentBlock {
-	if msg.ResponsesToolMessage == nil {
-		return nil
-	}
-
-	// Resolve the tool-use id (server_tool_use.id == tool_search_tool_result.tool_use_id).
-	var toolUseID *string
-	if msg.ResponsesToolMessage.CallID != nil {
-		toolUseID = msg.ResponsesToolMessage.CallID
-	} else {
-		toolUseID = msg.ID
-	}
-	// A JSON-decoded tool_search_call input item carries no CallID/ID (only the
-	// preserved raw bytes + arguments), so toolUseID can be nil. Anthropic rejects
-	// server_tool_use / tool_search_tool_result blocks with a nil id — skip rather
-	// than emit an invalid pair, consistent with the nil-ResponsesToolMessage guard.
-	if toolUseID == nil {
-		return nil
-	}
-
-	// 1. server_tool_use block. Preserve the search variant name (regex/bm25);
-	// the query is not retained on the neutral item, so send an empty input.
-	name := string(AnthropicToolNameToolSearchRegex)
-	if msg.ResponsesToolMessage.Name != nil && *msg.ResponsesToolMessage.Name != "" {
-		name = *msg.ResponsesToolMessage.Name
-	}
-	serverToolUseBlock := AnthropicContentBlock{
-		Type:  AnthropicContentBlockTypeServerToolUse,
-		ID:    toolUseID,
-		Name:  schemas.Ptr(name),
-		Input: json.RawMessage("{}"),
-	}
-
-	// 2. tool_search_tool_result block reconstructed from the discovered tool names.
-	var toolReferences []AnthropicContentBlock
-	if msg.ResponsesToolMessage.ResponsesToolSearchCall != nil {
-		for _, toolName := range msg.ResponsesToolMessage.ResponsesToolSearchCall.ToolReferences {
-			toolReferences = append(toolReferences, AnthropicContentBlock{
-				Type:     AnthropicContentBlockTypeToolReference,
-				ToolName: schemas.Ptr(toolName),
-			})
-		}
-	}
-	resultBlock := AnthropicContentBlock{
-		Type:           AnthropicContentBlockTypeToolSearchToolResult,
-		ToolUseID:      toolUseID,
-		ToolReferences: toolReferences,
-	}
-
-	return []AnthropicContentBlock{serverToolUseBlock, resultBlock}
-}
-
-// isAnthropicCodeExecutionToolName reports whether name is one of the code
-// execution sub-tools (code_execution_20250825+ surfaces bash + text_editor;
-// code_execution is the legacy Python sub-tool).
-func isAnthropicCodeExecutionToolName(name string) bool {
-	switch AnthropicToolName(name) {
-	case AnthropicToolNameCodeExecution, AnthropicToolNameBashCodeExecution, AnthropicToolNameTextEditorCodeExecution:
-		return true
-	default:
-		return false
-	}
-}
-
-// anthropicCodeExecResultBlockType maps a code-execution sub-tool name to its
-// outer *_tool_result block type.
-func anthropicCodeExecResultBlockType(toolName string) AnthropicContentBlockType {
-	switch AnthropicToolName(toolName) {
-	case AnthropicToolNameBashCodeExecution:
-		return AnthropicContentBlockTypeBashCodeExecutionToolResult
-	case AnthropicToolNameTextEditorCodeExecution:
-		return AnthropicContentBlockTypeTextEditorCodeExecutionToolResult
-	default:
-		return AnthropicContentBlockTypeCodeExecutionToolResult
-	}
-}
-
-// anthropicCodeExecInnerResultType maps a code-execution sub-tool name to its
-// inner result-content discriminator (used when the stored result type is absent).
-func anthropicCodeExecInnerResultType(toolName string) AnthropicContentBlockType {
-	switch AnthropicToolName(toolName) {
-	case AnthropicToolNameBashCodeExecution:
-		return AnthropicContentBlockTypeBashCodeExecutionResult
-	case AnthropicToolNameTextEditorCodeExecution:
-		return AnthropicContentBlockTypeTextEditorCodeExecutionResult
-	default:
-		return AnthropicContentBlockTypeCodeExecutionResult
-	}
-}
-
-// anthropicCodeExecOutputBlockType maps a code-execution sub-tool name to the
-// file-output block type emitted inside a result's content array.
-func anthropicCodeExecOutputBlockType(toolName string) AnthropicContentBlockType {
-	if AnthropicToolName(toolName) == AnthropicToolNameBashCodeExecution {
-		return AnthropicContentBlockTypeBashCodeExecutionOutput
-	}
-	return AnthropicContentBlockTypeCodeExecutionOutput
-}
-
-// buildBifrostCodeExecutionCall converts a code-execution server_tool_use block
-// into a neutral code_interpreter_call message that also carries the Anthropic
-// fidelity (sub-tool name, verbatim input, caller). The paired *_tool_result is
-// attached later by attachAnthropicCodeExecutionResult.
-func buildBifrostCodeExecutionCall(block AnthropicContentBlock) schemas.ResponsesMessage {
-	carry := &schemas.ResponsesCodeExecutionCall{}
-	if block.Name != nil {
-		carry.ToolName = *block.Name
-	}
-	ci := &schemas.ResponsesCodeInterpreterToolCall{}
-
-	if len(block.Input) > 0 {
-		raw := string(block.Input)
-		carry.Input = &raw
-		// Populate the neutral "code" for OpenAI-compatible consumers: Python uses
-		// "code", bash uses "command". text_editor verbs are not runnable code, so
-		// the neutral code stays empty and only the carry input round-trips them.
-		switch AnthropicToolName(carry.ToolName) {
-		case AnthropicToolNameCodeExecution:
-			if c := providerUtils.GetJSONField(block.Input, "code"); c.Exists() && c.Type == gjson.String {
-				ci.Code = schemas.Ptr(c.Str)
-			}
-		case AnthropicToolNameBashCodeExecution:
-			if c := providerUtils.GetJSONField(block.Input, "command"); c.Exists() && c.Type == gjson.String {
-				ci.Code = schemas.Ptr(c.Str)
-			}
-		}
-	}
-
-	if block.Caller != nil {
-		carry.Caller = &schemas.ResponsesToolCaller{
-			Type:   string(block.Caller.Type),
-			ToolID: block.Caller.ToolID,
-		}
-	}
-
-	return schemas.ResponsesMessage{
-		Type:   schemas.Ptr(schemas.ResponsesMessageTypeCodeInterpreterCall),
-		ID:     block.ID,
-		Status: schemas.Ptr("completed"),
-		ResponsesToolMessage: &schemas.ResponsesToolMessage{
-			CallID:                           block.ID,
-			ResponsesCodeInterpreterToolCall: ci,
-			ResponsesCodeExecutionCall:       carry,
-		},
-	}
-}
-
-// attachAnthropicCodeExecutionResult finds the most recent code_interpreter_call
-// matching toolUseID and folds the *_tool_result block onto it — both the
-// Anthropic fidelity carry and the neutral code_interpreter outputs.
-func attachAnthropicCodeExecutionResult(msgs []schemas.ResponsesMessage, toolUseID string, block AnthropicContentBlock) {
-	for i := len(msgs) - 1; i >= 0; i-- {
-		msg := &msgs[i]
-		if msg.Type == nil || *msg.Type != schemas.ResponsesMessageTypeCodeInterpreterCall {
-			continue
-		}
-		if msg.ResponsesToolMessage == nil || msg.ResponsesToolMessage.CallID == nil ||
-			*msg.ResponsesToolMessage.CallID != toolUseID {
-			continue
-		}
-
-		tm := msg.ResponsesToolMessage
-		if tm.ResponsesCodeExecutionCall == nil {
-			tm.ResponsesCodeExecutionCall = &schemas.ResponsesCodeExecutionCall{}
-		}
-		if tm.ResponsesCodeInterpreterToolCall == nil {
-			tm.ResponsesCodeInterpreterToolCall = &schemas.ResponsesCodeInterpreterToolCall{}
-		}
-		carry := tm.ResponsesCodeExecutionCall
-		ci := tm.ResponsesCodeInterpreterToolCall
-
-		// content is a single object on the wire (ContentObj); UnmarshalJSON may
-		// wrap it into ContentBlocks instead, so accept either.
-		var inner *AnthropicContentBlock
-		if c := block.Content; c != nil {
-			inner = c.ContentObj
-			if inner == nil && len(c.ContentBlocks) > 0 {
-				inner = &c.ContentBlocks[0]
-			}
-		}
-		if inner != nil {
-			carry.ResultType = string(inner.Type)
-			carry.Stdout = inner.Stdout
-			carry.Stderr = inner.Stderr
-			carry.ReturnCode = inner.ReturnCode
-			carry.EncryptedStdout = inner.EncryptedStdout
-			carry.FileType = inner.FileType
-			carry.StartLine = inner.StartLine
-			carry.NumLines = inner.NumLines
-			carry.TotalLines = inner.TotalLines
-			carry.IsFileUpdate = inner.IsFileUpdate
-			carry.OldStart = inner.OldStart
-			carry.OldLines = inner.OldLines
-			carry.NewStart = inner.NewStart
-			carry.NewLines = inner.NewLines
-			carry.Lines = inner.Lines
-			carry.ErrorCode = inner.ErrorCode
-
-			// The inner result's own "content" is either a string (text_editor view
-			// file contents) or an array of file-output blocks (bash/python files).
-			if ic := inner.Content; ic != nil {
-				if ic.ContentStr != nil {
-					carry.FileContent = ic.ContentStr
-				}
-				for _, fb := range ic.ContentBlocks {
-					if fb.FileID != nil {
-						carry.Files = append(carry.Files, schemas.ResponsesCodeExecutionFileOutput{FileID: *fb.FileID})
-					}
-				}
-			}
-
-			// Neutral OpenAI-compatible view: stdout becomes a logs output.
-			if inner.Stdout != nil && *inner.Stdout != "" {
-				ci.Outputs = append(ci.Outputs, schemas.ResponsesCodeInterpreterOutput{
-					ResponsesCodeInterpreterOutputLogs: &schemas.ResponsesCodeInterpreterOutputLogs{
-						Type: "logs",
-						Logs: *inner.Stdout,
-					},
-				})
-			}
-		}
-
-		// The caller union may also appear on the result block.
-		if block.Caller != nil && carry.Caller == nil {
-			carry.Caller = &schemas.ResponsesToolCaller{
-				Type:   string(block.Caller.Type),
-				ToolID: block.Caller.ToolID,
-			}
-		}
-
-		if carry.ErrorCode != nil {
-			msg.Status = schemas.Ptr("failed")
-		}
-		return
-	}
-}
-
-// convertBifrostCodeExecCallToAnthropicBlocks rebuilds the Anthropic
-// server_tool_use + *_code_execution_tool_result block pair from a neutral
-// code_interpreter_call carrying ResponsesCodeExecutionCall. Anthropic requires
-// both blocks to appear together in the assistant message.
-func convertBifrostCodeExecCallToAnthropicBlocks(msg *schemas.ResponsesMessage) []AnthropicContentBlock {
-	tm := msg.ResponsesToolMessage
-	if tm == nil {
-		return nil
-	}
-	cec := tm.ResponsesCodeExecutionCall
-	ci := tm.ResponsesCodeInterpreterToolCall
-	if cec == nil && ci == nil {
-		return nil
-	}
-	if cec == nil {
-		// OpenAI-origin code_interpreter_call without the Anthropic carry: synthesize
-		// the fidelity from the neutral fields so it still round-trips to Anthropic.
-		cec = &schemas.ResponsesCodeExecutionCall{}
-	}
-
-	var toolUseID *string
-	if tm.CallID != nil {
-		toolUseID = tm.CallID
-	} else {
-		toolUseID = msg.ID
-	}
-	toolUseID = providerUtils.SanitizeAnthropicToolUseIDPtr(toolUseID)
-
-	toolName := cec.ToolName
-	if toolName == "" {
-		toolName = string(AnthropicToolNameCodeExecution)
-	}
-
-	// 1. server_tool_use block.
-	serverToolUse := AnthropicContentBlock{
-		Type: AnthropicContentBlockTypeServerToolUse,
-		ID:   toolUseID,
-		Name: schemas.Ptr(toolName),
-	}
-	if cec.Input != nil {
-		serverToolUse.Input = json.RawMessage(*cec.Input)
-	} else if ci != nil && ci.Code != nil {
-		// Reconstruct a minimal input from the neutral code field.
-		key := "code"
-		if AnthropicToolName(toolName) == AnthropicToolNameBashCodeExecution {
-			key = "command"
-		}
-		if inputBytes, err := providerUtils.MarshalSorted(map[string]interface{}{key: *ci.Code}); err == nil {
-			serverToolUse.Input = json.RawMessage(inputBytes)
-		}
-	}
-	if cec.Caller != nil {
-		serverToolUse.Caller = &AnthropicToolCaller{
-			Type:   AnthropicToolCallerType(cec.Caller.Type),
-			ToolID: providerUtils.SanitizeAnthropicToolUseIDPtr(cec.Caller.ToolID),
-		}
-	}
-
-	// 2. inner result-content object.
-	stdout := cec.Stdout
-	if stdout == nil && ci != nil {
-		// OpenAI-origin: fold the first logs output back into stdout.
-		for _, o := range ci.Outputs {
-			if o.ResponsesCodeInterpreterOutputLogs != nil {
-				logs := o.ResponsesCodeInterpreterOutputLogs.Logs
-				stdout = &logs
-				break
-			}
-		}
-	}
-	inner := AnthropicContentBlock{
-		Type:            AnthropicContentBlockType(cec.ResultType),
-		Stdout:          stdout,
-		Stderr:          cec.Stderr,
-		ReturnCode:      cec.ReturnCode,
-		EncryptedStdout: cec.EncryptedStdout,
-		FileType:        cec.FileType,
-		StartLine:       cec.StartLine,
-		NumLines:        cec.NumLines,
-		TotalLines:      cec.TotalLines,
-		IsFileUpdate:    cec.IsFileUpdate,
-		OldStart:        cec.OldStart,
-		OldLines:        cec.OldLines,
-		NewStart:        cec.NewStart,
-		NewLines:        cec.NewLines,
-		Lines:           cec.Lines,
-		ErrorCode:       cec.ErrorCode,
-	}
-	if inner.Type == "" {
-		inner.Type = anthropicCodeExecInnerResultType(toolName)
-	}
-
-	// Rebuild the inner result's own "content": text_editor view file contents
-	// (string) and/or generated file outputs (array of *_code_execution_output).
-	var innerContent *AnthropicContent
-	if cec.FileContent != nil {
-		innerContent = &AnthropicContent{ContentStr: cec.FileContent}
-	}
-	if len(cec.Files) > 0 {
-		outputType := anthropicCodeExecOutputBlockType(toolName)
-		fileBlocks := make([]AnthropicContentBlock, 0, len(cec.Files))
-		for _, f := range cec.Files {
-			fileID := f.FileID
-			fileBlocks = append(fileBlocks, AnthropicContentBlock{Type: outputType, FileID: &fileID})
-		}
-		if innerContent == nil {
-			innerContent = &AnthropicContent{}
-		}
-		innerContent.ContentBlocks = fileBlocks
-	}
-
-	if innerContent == nil {
-		switch inner.Type {
-		case AnthropicContentBlockTypeCodeExecutionResult,
-			AnthropicContentBlockTypeBashCodeExecutionResult,
-			AnthropicContentBlockTypeEncryptedCodeExecutionResult:
-			innerContent = &AnthropicContent{ContentBlocks: []AnthropicContentBlock{}}
-		}
-	}
-	inner.Content = innerContent
-
-	// 3. outer *_tool_result block wrapping the inner content object.
-	resultBlock := AnthropicContentBlock{
-		Type:      anthropicCodeExecResultBlockType(toolName),
-		ToolUseID: toolUseID,
-		Content:   &AnthropicContent{ContentObj: &inner},
-	}
-	if cec.Caller != nil {
-		resultBlock.Caller = &AnthropicToolCaller{
-			Type:   AnthropicToolCallerType(cec.Caller.Type),
-			ToolID: providerUtils.SanitizeAnthropicToolUseIDPtr(cec.Caller.ToolID),
-		}
-	}
-
-	return []AnthropicContentBlock{serverToolUse, resultBlock}
 }
 
 // convertBifrostUnsupportedToolCallToAnthropicMessage converts unsupported tool calls to text messages
@@ -7633,7 +4880,7 @@ func convertBifrostComputerCallOutputToAnthropicMessage(msg *schemas.ResponsesMe
 	if msg.ResponsesToolMessage != nil {
 		toolResultBlock := AnthropicContentBlock{
 			Type:      AnthropicContentBlockTypeToolResult,
-			ToolUseID: providerUtils.SanitizeAnthropicToolUseIDPtr(msg.ResponsesToolMessage.CallID),
+			ToolUseID: msg.ResponsesToolMessage.CallID,
 		}
 
 		if msg.ResponsesToolMessage.Output != nil {
@@ -7687,14 +4934,28 @@ func convertAnthropicToolToBifrost(tool *AnthropicTool) *schemas.ResponsesTool {
 
 	// Handle special tool types first
 	if tool.Type != nil {
-		// Version-dated server search tools ship new versions regularly; match them by
-		// prefix so a newer version (e.g. web_fetch_20260318) is recognized as a server
-		// tool instead of falling through to the client-function default at the end of
-		// this function. Mirrors applySharedServerToolFields and the chat path. Tools
-		// that must round-trip their exact version (code_execution, text_editor) stay in
-		// the exact switch below.
-		switch typeStr := string(*tool.Type); {
-		case strings.HasPrefix(typeStr, "web_search_"):
+		switch *tool.Type {
+		case AnthropicToolTypeComputer20250124, AnthropicToolTypeComputer20251124:
+			bifrostTool := &schemas.ResponsesTool{
+				Type: schemas.ResponsesToolTypeComputerUsePreview,
+			}
+			if tool.AnthropicToolComputerUse != nil {
+				bifrostTool.ResponsesToolComputerUsePreview = &schemas.ResponsesToolComputerUsePreview{
+					Environment: "browser", // Default environment
+				}
+				if tool.AnthropicToolComputerUse.DisplayWidthPx != nil {
+					bifrostTool.ResponsesToolComputerUsePreview.DisplayWidth = *tool.AnthropicToolComputerUse.DisplayWidthPx
+				}
+				if tool.AnthropicToolComputerUse.DisplayHeightPx != nil {
+					bifrostTool.ResponsesToolComputerUsePreview.DisplayHeight = *tool.AnthropicToolComputerUse.DisplayHeightPx
+				}
+				if tool.AnthropicToolComputerUse.EnableZoom != nil {
+					bifrostTool.ResponsesToolComputerUsePreview.EnableZoom = tool.AnthropicToolComputerUse.EnableZoom
+				}
+			}
+			return bifrostTool
+
+		case AnthropicToolTypeWebSearch20250305, AnthropicToolTypeWebSearch20260209:
 			bifrostTool := &schemas.ResponsesTool{
 				Type: schemas.ResponsesToolTypeWebSearch,
 			}
@@ -7720,16 +4981,14 @@ func convertAnthropicToolToBifrost(tool *AnthropicTool) *schemas.ResponsesTool {
 
 			return bifrostTool
 
-		case strings.HasPrefix(typeStr, "web_fetch_"):
+		case AnthropicToolTypeWebFetch20250910, AnthropicToolTypeWebFetch20260209, AnthropicToolTypeWebFetch20260309:
 			bifrostTool := &schemas.ResponsesTool{
 				Type: schemas.ResponsesToolTypeWebFetch,
 			}
 			if tool.AnthropicToolWebFetch != nil {
 				bifrostTool.ResponsesToolWebFetch = &schemas.ResponsesToolWebFetch{
-					MaxUses:           tool.AnthropicToolWebFetch.MaxUses,
-					MaxContentTokens:  tool.AnthropicToolWebFetch.MaxContentTokens,
-					UseCache:          tool.AnthropicToolWebFetch.UseCache,
-					ResponseInclusion: tool.AnthropicToolWebFetch.ResponseInclusion,
+					MaxUses:          tool.AnthropicToolWebFetch.MaxUses,
+					MaxContentTokens: tool.AnthropicToolWebFetch.MaxContentTokens,
 				}
 				if len(tool.AnthropicToolWebFetch.AllowedDomains) > 0 || len(tool.AnthropicToolWebFetch.BlockedDomains) > 0 {
 					bifrostTool.ResponsesToolWebFetch.Filters = &schemas.ResponsesToolWebSearchFilters{
@@ -7739,38 +4998,10 @@ func convertAnthropicToolToBifrost(tool *AnthropicTool) *schemas.ResponsesTool {
 				}
 			}
 			return bifrostTool
-		}
 
-		switch *tool.Type {
-		case AnthropicToolTypeComputer20250124, AnthropicToolTypeComputer20251124:
-			bifrostTool := &schemas.ResponsesTool{
-				Type: schemas.ResponsesToolTypeComputerUsePreview,
-			}
-			if tool.AnthropicToolComputerUse != nil {
-				bifrostTool.ResponsesToolComputerUsePreview = &schemas.ResponsesToolComputerUsePreview{
-					Environment: "browser", // Default environment
-				}
-				if tool.AnthropicToolComputerUse.DisplayWidthPx != nil {
-					bifrostTool.ResponsesToolComputerUsePreview.DisplayWidth = *tool.AnthropicToolComputerUse.DisplayWidthPx
-				}
-				if tool.AnthropicToolComputerUse.DisplayHeightPx != nil {
-					bifrostTool.ResponsesToolComputerUsePreview.DisplayHeight = *tool.AnthropicToolComputerUse.DisplayHeightPx
-				}
-				if tool.AnthropicToolComputerUse.EnableZoom != nil {
-					bifrostTool.ResponsesToolComputerUsePreview.EnableZoom = tool.AnthropicToolComputerUse.EnableZoom
-				}
-			}
-			return bifrostTool
-
-		case AnthropicToolTypeCodeExecution20250522, AnthropicToolTypeCodeExecution,
-			AnthropicToolTypeCodeExecution20260120, AnthropicToolTypeCodeExecution20260521:
-			// Preserve the exact requested version so its capability tier
-			// (bash/file vs. PTC+REPL vs. disclosed time limit) round-trips.
+		case AnthropicToolTypeCodeExecution20250522, AnthropicToolTypeCodeExecution, AnthropicToolTypeCodeExecution20260120:
 			return &schemas.ResponsesTool{
 				Type: schemas.ResponsesToolTypeCodeInterpreter,
-				ResponsesToolCodeInterpreter: &schemas.ResponsesToolCodeInterpreter{
-					Version: schemas.Ptr(string(*tool.Type)),
-				},
 			}
 
 		case AnthropicToolTypeMemory20250818:
@@ -7806,25 +5037,6 @@ func convertAnthropicToolToBifrost(tool *AnthropicTool) *schemas.ResponsesTool {
 				Type: schemas.ResponsesToolType(AnthropicToolTypeTextEditor20250728),
 				Name: &tool.Name,
 			}
-
-		case AnthropicToolTypeAdvisor20260301:
-			bifrostTool := &schemas.ResponsesTool{
-				Type: schemas.ResponsesToolTypeAdvisor,
-			}
-			if tool.AnthropicToolAdvisor != nil {
-				bifrostTool.ResponsesToolAdvisor = &schemas.ResponsesToolAdvisor{
-					Model:     tool.AnthropicToolAdvisor.Model,
-					MaxUses:   tool.AnthropicToolAdvisor.MaxUses,
-					MaxTokens: tool.AnthropicToolAdvisor.MaxTokens,
-				}
-				if tool.AnthropicToolAdvisor.Caching != nil {
-					bifrostTool.ResponsesToolAdvisor.Caching = &schemas.ResponsesToolAdvisorCaching{
-						Type: tool.AnthropicToolAdvisor.Caching.Type,
-						TTL:  tool.AnthropicToolAdvisor.Caching.TTL,
-					}
-				}
-			}
-			return bifrostTool
 		}
 	}
 
@@ -8071,19 +5283,9 @@ func convertBifrostToolToAnthropic(model string, tool *schemas.ResponsesTool, pr
 			// Including it explicitly causes "Auto-injecting tools would conflict" errors.
 			return nil
 		}
-		// When no web search/fetch, explicitly include code_execution. Forward the
-		// exact requested version verbatim (its capability tier — bash/file vs.
-		// PTC+REPL vs. disclosed time limit — must round-trip). Fall back to
-		// 20250825, the only version every model supports, when none was captured
-		// (e.g. an OpenAI-origin code_interpreter request).
-		codeExecVersion := AnthropicToolTypeCodeExecution
-		if tool.ResponsesToolCodeInterpreter != nil &&
-			tool.ResponsesToolCodeInterpreter.Version != nil &&
-			*tool.ResponsesToolCodeInterpreter.Version != "" {
-			codeExecVersion = AnthropicToolType(*tool.ResponsesToolCodeInterpreter.Version)
-		}
+		// When no web search/fetch, explicitly include code_execution
 		return &AnthropicTool{
-			Type: schemas.Ptr(codeExecVersion),
+			Type: schemas.Ptr(AnthropicToolTypeCodeExecution),
 			Name: string(AnthropicToolNameCodeExecution),
 		}
 	case schemas.ResponsesToolTypeComputerUsePreview:
@@ -8105,10 +5307,10 @@ func convertBifrostToolToAnthropic(model string, tool *schemas.ResponsesTool, pr
 		}
 	case schemas.ResponsesToolTypeWebSearch:
 		webSearchType := AnthropicToolTypeWebSearch20250305
-		// Dynamic filtering (web_search_20260209) available on Anthropic + Azure for Opus 4.6+, Sonnet 4.6+.
+		// Dynamic filtering (web_search_20260209) available on Anthropic + Azure for Opus 4.6+.
 		features, ok := ProviderFeatures[provider]
 		if ok && features.WebSearchDynamic &&
-			(strings.Contains(model, "4.6") || strings.Contains(model, "4-6") || IsOpus47Plus(model) || IsSonnet5Plus(model) || IsFableFamily(model)) {
+			(strings.Contains(model, "4.6") || strings.Contains(model, "4-6") || IsOpus47Plus(model) || IsFableFamily(model)) {
 			webSearchType = AnthropicToolTypeWebSearch20260209
 		}
 		anthropicTool := &AnthropicTool{
@@ -8143,12 +5345,6 @@ func convertBifrostToolToAnthropic(model string, tool *schemas.ResponsesTool, pr
 			(strings.Contains(model, "4.6") || strings.Contains(model, "4-6")) {
 			webFetchType = AnthropicToolTypeWebFetch20260309
 		}
-		if tool.ResponsesToolWebFetch != nil && tool.ResponsesToolWebFetch.ResponseInclusion != nil {
-			webFetchType = AnthropicToolTypeWebFetch20260318
-		} else if tool.ResponsesToolWebFetch != nil && tool.ResponsesToolWebFetch.UseCache != nil &&
-			webFetchType == AnthropicToolTypeWebFetch20250910 {
-			webFetchType = AnthropicToolTypeWebFetch20260309
-		}
 		anthropicTool := &AnthropicTool{
 			Type:                  schemas.Ptr(webFetchType),
 			Name:                  string(AnthropicToolNameWebFetch),
@@ -8157,8 +5353,6 @@ func convertBifrostToolToAnthropic(model string, tool *schemas.ResponsesTool, pr
 		if tool.ResponsesToolWebFetch != nil {
 			anthropicTool.AnthropicToolWebFetch.MaxUses = tool.ResponsesToolWebFetch.MaxUses
 			anthropicTool.AnthropicToolWebFetch.MaxContentTokens = tool.ResponsesToolWebFetch.MaxContentTokens
-			anthropicTool.AnthropicToolWebFetch.UseCache = tool.ResponsesToolWebFetch.UseCache
-			anthropicTool.AnthropicToolWebFetch.ResponseInclusion = tool.ResponsesToolWebFetch.ResponseInclusion
 			if tool.ResponsesToolWebFetch.Filters != nil {
 				anthropicTool.AnthropicToolWebFetch.AllowedDomains = tool.ResponsesToolWebFetch.Filters.AllowedDomains
 				anthropicTool.AnthropicToolWebFetch.BlockedDomains = tool.ResponsesToolWebFetch.Filters.BlockedDomains
@@ -8201,24 +5395,6 @@ func convertBifrostToolToAnthropic(model string, tool *schemas.ResponsesTool, pr
 		return &AnthropicTool{
 			Type: schemas.Ptr(AnthropicToolTypeTextEditor20250728),
 			Name: string(AnthropicToolNameTextEditor),
-		}
-	case schemas.ResponsesToolTypeAdvisor:
-		advisor := &AnthropicToolAdvisor{}
-		if tool.ResponsesToolAdvisor != nil {
-			advisor.Model = tool.ResponsesToolAdvisor.Model
-			advisor.MaxUses = tool.ResponsesToolAdvisor.MaxUses
-			advisor.MaxTokens = tool.ResponsesToolAdvisor.MaxTokens
-			if tool.ResponsesToolAdvisor.Caching != nil {
-				advisor.Caching = &AnthropicToolAdvisorCaching{
-					Type: tool.ResponsesToolAdvisor.Caching.Type,
-					TTL:  tool.ResponsesToolAdvisor.Caching.TTL,
-				}
-			}
-		}
-		return &AnthropicTool{
-			Type:                 schemas.Ptr(AnthropicToolTypeAdvisor20260301),
-			Name:                 string(AnthropicToolNameAdvisor),
-			AnthropicToolAdvisor: advisor,
 		}
 	}
 
@@ -8364,36 +5540,15 @@ func convertContentBlockToAnthropic(block schemas.ResponsesMessageContentBlock) 
 				CacheControl: block.CacheControl,
 			}
 		}
-	case schemas.ResponsesOutputMessageContentTypeFallback:
-		if fb := block.ResponsesOutputMessageContentFallback; fb != nil {
-			fallbackBlock := &AnthropicContentBlock{
-				Type: AnthropicContentBlockTypeFallback,
-				From: &AnthropicFallbackModel{Model: fb.FromModel},
-				To:   &AnthropicFallbackModel{Model: fb.ToModel},
-			}
-			if fb.TriggerType != "" {
-				fallbackBlock.Trigger = &AnthropicFallbackTrigger{Type: fb.TriggerType, Category: fb.TriggerCategory}
-			}
-			return fallbackBlock
-		}
 	case schemas.ResponsesInputMessageContentBlockTypeFile:
-		if block.ResponsesInputMessageContentBlockFile != nil || block.FileID != nil {
+		if block.ResponsesInputMessageContentBlockFile != nil {
 			// Direct conversion without intermediate ChatContentBlock
 			anthropicBlock := ConvertResponsesFileBlockToAnthropic(
 				block.ResponsesInputMessageContentBlockFile,
-				block.FileID,
 				block.CacheControl,
 				block.Citations,
 			)
 			return &anthropicBlock
-		}
-	case schemas.ResponsesInputMessageContentBlockTypeContainer:
-		if block.FileID != nil {
-			return &AnthropicContentBlock{
-				Type:         AnthropicContentBlockTypeContainerUpload,
-				FileID:       block.FileID,
-				CacheControl: block.CacheControl,
-			}
 		}
 	case schemas.ResponsesOutputMessageContentTypeReasoning:
 		if block.Text != nil {
@@ -8430,14 +5585,6 @@ func (block AnthropicContentBlock) toBifrostResponsesImageBlock() schemas.Respon
 		ResponsesInputMessageContentBlockImage: &schemas.ResponsesInputMessageContentBlockImage{
 			ImageURL: schemas.Ptr(getImageURLFromBlock(block)),
 		},
-		CacheControl: block.CacheControl,
-	}
-}
-
-func (block AnthropicContentBlock) toBifrostResponsesContainerUploadBlock() schemas.ResponsesMessageContentBlock {
-	return schemas.ResponsesMessageContentBlock{
-		Type:         schemas.ResponsesInputMessageContentBlockTypeContainer,
-		FileID:       block.FileID,
 		CacheControl: block.CacheControl,
 	}
 }
@@ -8493,54 +5640,9 @@ func (block AnthropicContentBlock) toBifrostResponsesDocumentBlock() schemas.Res
 			resultBlock.ResponsesInputMessageContentBlockFile.FileType = schemas.Ptr("text/plain")
 			resultBlock.ResponsesInputMessageContentBlockFile.FileData = src.Data
 		}
-	case "file":
-		// File ID reference (requires files-api-2025-04-14 beta header)
-		if src.FileID != nil {
-			resultBlock.FileID = src.FileID
-		}
-	}
-
-	// Anthropic's document block has an optional `title`; OpenAI's Responses
-	// API rejects an input_file that carries inline file_data without a
-	// filename. Synthesize one so a title-less document (the common case when
-	// a tool returns a PDF) still converts into an acceptable request.
-	file := resultBlock.ResponsesInputMessageContentBlockFile
-	if file.FileData != nil && (file.Filename == nil || *file.Filename == "") {
-		file.Filename = schemas.Ptr(defaultDocumentFilename(src))
 	}
 
 	return resultBlock
-}
-
-// defaultDocumentFilename builds a filename for a document block that has no
-// title, picking the extension from the source's media type. Anthropic
-// defaults document blocks to PDF, so that's the fallback.
-func defaultDocumentFilename(src *AnthropicSource) string {
-	mediaType := ""
-	if src != nil && src.MediaType != nil {
-		mediaType = *src.MediaType
-	}
-	if src != nil && src.Type == "text" {
-		mediaType = "text/plain"
-	}
-
-	ext := ".pdf"
-	switch mediaType {
-	case "", "application/pdf":
-		ext = ".pdf"
-	case "text/plain":
-		ext = ".txt"
-	default:
-		// "application/json" -> ".json", "text/markdown" -> ".markdown".
-		if _, subtype, found := strings.Cut(mediaType, "/"); found && subtype != "" {
-			// Strip vendor/suffix decorations: "vnd.ms-excel+xml" -> "xml".
-			if _, suffix, hasSuffix := strings.Cut(subtype, "+"); hasSuffix && suffix != "" {
-				subtype = suffix
-			}
-			ext = "." + subtype
-		}
-	}
-	return "document" + ext
 }
 
 // Helper functions for MCP tool/server conversion
@@ -9115,15 +6217,11 @@ func generateSyntheticInputJSONDeltas(argumentsJSON string, contentIndex *int) [
 		},
 	})
 
-	// Break the JSON into chunks on rune boundaries — slicing by bytes would
-	// split a multi-byte UTF-8 rune across two deltas, emitting invalid UTF-8 on
-	// the wire (the SDK's SSE decoder rejects it). Concatenating the rune chunks
-	// still reconstructs the exact JSON for parsing at content_block_stop.
-	runes := []rune(argumentsJSON)
-	for i := 0; i < len(runes); i += chunkSize {
-		end := min(i+chunkSize, len(runes))
+	// Break the JSON into chunks
+	for i := 0; i < len(argumentsJSON); i += chunkSize {
+		end := min(i+chunkSize, len(argumentsJSON))
 
-		chunk := string(runes[i:end])
+		chunk := argumentsJSON[i:end]
 		events = append(events, &AnthropicStreamEvent{
 			Type:  AnthropicStreamEventTypeContentBlockDelta,
 			Index: contentIndex,

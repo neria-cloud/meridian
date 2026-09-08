@@ -67,7 +67,6 @@ func (r *BifrostTextCompletionRequest) ToBifrostChatRequest() *BifrostChatReques
 type BifrostTextCompletionResponse struct {
 	ID                string                     `json:"id"`
 	Choices           []BifrostResponseChoice    `json:"choices"`
-	Created           int                        `json:"created,omitempty"` // The Unix timestamp (in seconds).
 	Model             string                     `json:"model"`
 	Object            string                     `json:"object"` // "text_completion" (same for text completion stream)
 	SystemFingerprint string                     `json:"system_fingerprint"`
@@ -135,7 +134,7 @@ type TextCompletionParameters struct {
 
 	// Dynamic parameters that can be provider-specific, they are directly
 	// added to the request as is.
-	ExtraParams map[string]any `json:"-"`
+	ExtraParams map[string]interface{} `json:"-"`
 }
 
 // TextCompletionLogProb represents log probability information for text completion.

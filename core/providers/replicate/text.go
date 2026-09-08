@@ -93,10 +93,9 @@ func (response *ReplicatePredictionResponse) ToBifrostTextCompletionResponse() *
 
 	// Initialize Bifrost response
 	bifrostResponse := &schemas.BifrostTextCompletionResponse{
-		ID:      response.ID,
-		Model:   response.Model,
-		Created: int(ParseReplicateTimestamp(response.CreatedAt)),
-		Object:  "text_completion",
+		ID:     response.ID,
+		Model:  response.Model,
+		Object: "text_completion",
 	}
 
 	// Convert output to text

@@ -1,7 +1,10 @@
 package cohere
 
 import (
+	"encoding/json"
+
 	"github.com/neria-cloud/meridian/core/schemas"
+	"github.com/tidwall/sjson"
 )
 
 var (
@@ -238,16 +241,17 @@ func convertResponseFormatToCohere(responseFormat *interface{}) *CohereResponseF
 		return nil
 	}
 
-	// The value may be an order-preserving OrderedMap (the wire path) or a plain
-	// map built in Go; ParseChatResponseFormat accepts both.
-	rf, ok := schemas.ParseChatResponseFormat(responseFormat)
+	// Try to extract as map
+	formatMap, ok := (*responseFormat).(map[string]interface{})
 	if !ok {
 		return nil
 	}
 
 	cohereFormat := &CohereResponseFormat{}
 
-	switch rf.Type {
+	// Extract type
+	typeStr, _ := formatMap["type"].(string)
+	switch typeStr {
 	case "text":
 		cohereFormat.Type = ResponseFormatTypeText
 	case "json_object", "json_schema":
@@ -255,11 +259,11 @@ func convertResponseFormatToCohere(responseFormat *interface{}) *CohereResponseF
 
 		// Extract the nested schema
 		// OpenAI format: { type: "json_schema", json_schema: { name: "X", strict: true, schema: {...} } }
-		// Cohere takes the schema as-is, so forward the client's bytes rather
-		// than a re-encoding of them.
-		if schema := rf.RawSchema(); len(schema) > 0 {
-			var schemaInterface interface{} = schema
-			cohereFormat.JSONSchema = &schemaInterface
+		if jsonSchemaWrapper, ok := formatMap["json_schema"].(map[string]interface{}); ok {
+			if schema, ok := jsonSchemaWrapper["schema"].(map[string]interface{}); ok {
+				var schemaInterface interface{} = schema
+				cohereFormat.JSONSchema = &schemaInterface
+			}
 		}
 	default:
 		return nil
@@ -274,26 +278,16 @@ func convertCohereResponseFormatToBifrost(cohereFormat *CohereResponseFormat) *i
 		return nil
 	}
 
-	// Must be a map[string]interface{}: that is what every other inbound path yields, and
-	// consumers type-assert to it. anthropic/utils.go convertChatResponseFormatToTool returns
-	// nil on anything else, so a json.RawMessage here meant Anthropic applied no structured
-	// output at all and answered with markdown-fenced JSON.
-	result := map[string]interface{}{}
+	// Build JSON bytes with deterministic key order using sjson
+	data := []byte(`{}`)
 	if cohereFormat.JSONSchema != nil {
-		// Cohere carries the RAW schema; the canonical form expects json_schema to be a
-		// wrapper {name, schema}. Emitting the bare schema was rejected upstream with
-		// "Missing required parameter: 'response_format.json_schema.name'". Cohere supplies
-		// no name, so synthesize one - `strict` is deliberately left unset, since arbitrary
-		// Cohere schemas need not satisfy the stricter subset.
-		result["type"] = "json_schema"
-		result["json_schema"] = map[string]interface{}{
-			"name":   "response",
-			"schema": *cohereFormat.JSONSchema,
-		}
+		data, _ = sjson.SetBytes(data, "type", "json_schema")
+		schemaBytes, _ := schemas.MarshalSorted(cohereFormat.JSONSchema)
+		data, _ = sjson.SetRawBytes(data, "json_schema", schemaBytes)
 	} else {
-		result["type"] = string(cohereFormat.Type)
+		data, _ = sjson.SetBytes(data, "type", string(cohereFormat.Type))
 	}
 
-	var resultInterface interface{} = result
+	var resultInterface interface{} = json.RawMessage(data)
 	return &resultInterface
 }

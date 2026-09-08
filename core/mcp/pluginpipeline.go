@@ -2,20 +2,12 @@ package mcp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/neria-cloud/meridian/core/schemas"
-)
-
-// Sentinels wrapped (%w) into wire-op errors so mcpErrorType classifies error.type via
-// errors.Is, not message text. toolmanager.go wraps them at the CallTool site.
-var (
-	ErrMCPToolTimeout    = errors.New("mcp tool call timed out")
-	ErrMCPToolCallFailed = errors.New("mcp tool call failed")
 )
 
 // MCPOpFunc is the closure each call site provides to RunWithPluginPipeline. It receives the
@@ -57,111 +49,80 @@ func (m *MCPManager) RunWithPluginPipeline(
 		}
 	}
 
-	// Span layout mirrors the LLM path: /mcp HTTP span is the parent, PreHook spans chain
-	// under it, the op span nests under the last PreHook, and PostHook spans nest under the
-	// op span. A PreHook short-circuit produces no op span (like a short-circuited llm.call).
+	// Wrap the whole gate (PreHook + op + PostHook) in an outer span so traces show one
+	// row per MCP op alongside the per-plugin spans the pipeline emits internally.
 	tracer, _ := ctx.Value(schemas.BifrostContextKeyTracer).(schemas.Tracer)
-
-	// Stamped on every wrapped BifrostError so downstream gates discriminate execute-tool
-	// from ping/list_tools.
-	mcpReqType := schemas.MCPRequestType("")
-	if req != nil {
-		mcpReqType = req.RequestType
-	}
-
-	// Set by startOpSpan only when the wire op runs (nil for short-circuits → deferred end
-	// is a no-op). startOpSpan threads the new span id onto ctx (no restore) so the op and
-	// PostHook spans nest under it.
-	var opSpanHandle schemas.SpanHandle
-	startOpSpan := func(r *schemas.BifrostMCPRequest) {
-		if tracer == nil {
-			return
+	var spanHandle schemas.SpanHandle
+	if tracer != nil {
+		spanName := fmt.Sprintf("mcp.%s", req.RequestType)
+		if req.ClientName != "" {
+			spanName = fmt.Sprintf("%s.%s", spanName, req.ClientName)
 		}
-		spanName := fmt.Sprintf("mcp.%s", mcpReqType)
-		if r != nil && r.ClientName != "" {
-			spanName = fmt.Sprintf("%s.%s", spanName, r.ClientName)
-		}
-		spanKind := schemas.SpanKindMCPClient
-		if mcpReqType.IsExecuteTool() {
-			spanKind = schemas.SpanKindMCPTool
-		}
-		spanCtx, handle := tracer.StartSpan(ctx, spanName, spanKind)
-		opSpanHandle = handle
-		if spanCtx != nil {
-			if id, ok := spanCtx.Value(schemas.BifrostContextKeySpanID).(string); ok && id != "" {
-				ctx.SetValue(schemas.BifrostContextKeySpanID, id)
-			}
-		}
-		if r == nil {
-			return
-		}
-		tracer.SetAttribute(handle, schemas.AttrMCPMethodName, r.RequestType.OTelMethodName())
-		if transport := m.connectionTypeForClientName(r.ClientName).OTelNetworkTransport(); transport != "" {
-			tracer.SetAttribute(handle, schemas.AttrNetworkTransport, transport)
-		}
+		_, spanHandle = tracer.StartSpan(ctx, spanName, schemas.SpanKindMCPClient)
 		// Emit OTel GenAI tool-execution attributes on execute-tool spans so downstream
 		// backends can correlate tool calls with their requesting llm.call.
-		if r.RequestType.IsExecuteTool() {
-			tracer.SetAttribute(handle, schemas.AttrOperationName, schemas.OTelOperationNameExecuteTool)
-			tracer.SetAttribute(handle, schemas.AttrToolType, "function")
-			if name := r.GetToolName(); name != "" {
-				tracer.SetAttribute(handle, schemas.AttrToolName, name)
+		if req != nil && req.RequestType.IsExecuteTool() {
+			tracer.SetAttribute(spanHandle, schemas.AttrOperationName, schemas.OTelOperationNameExecuteTool)
+			tracer.SetAttribute(spanHandle, schemas.AttrToolType, "function")
+			if name := req.GetToolName(); name != "" {
+				tracer.SetAttribute(spanHandle, schemas.AttrToolName, name)
 			}
-			// GetToolArguments returns interface{}; the Responses branch boxes a *string, so
-			// a nil pointer survives the != nil guard. Deref non-nil so the attr is the JSON string.
-			if args := r.GetToolArguments(); args != nil {
+			// GetToolArguments returns interface{}; the Responses branch boxes a
+			// *string, so a nil pointer survives the != nil guard. Unwrap and skip
+			// it explicitly, and deref non-nil so the attribute is the JSON string.
+			if args := req.GetToolArguments(); args != nil {
 				if p, ok := args.(*string); ok {
 					if p != nil {
-						tracer.SetAttribute(handle, schemas.AttrToolCallArguments, *p)
+						tracer.SetAttribute(spanHandle, schemas.AttrToolCallArguments, *p)
 					}
 				} else {
-					tracer.SetAttribute(handle, schemas.AttrToolCallArguments, args)
+					tracer.SetAttribute(spanHandle, schemas.AttrToolCallArguments, args)
 				}
 			}
-			if r.ChatAssistantMessageToolCall != nil && r.ChatAssistantMessageToolCall.ID != nil {
-				tracer.SetAttribute(handle, schemas.AttrToolCallID, *r.ChatAssistantMessageToolCall.ID)
-			} else if r.ResponsesToolMessage != nil && r.ResponsesToolMessage.CallID != nil {
-				tracer.SetAttribute(handle, schemas.AttrToolCallID, *r.ResponsesToolMessage.CallID)
+			if req.ChatAssistantMessageToolCall != nil && req.ChatAssistantMessageToolCall.ID != nil {
+				tracer.SetAttribute(spanHandle, schemas.AttrToolCallID, *req.ChatAssistantMessageToolCall.ID)
+			} else if req.ResponsesToolMessage != nil && req.ResponsesToolMessage.CallID != nil {
+				tracer.SetAttribute(spanHandle, schemas.AttrToolCallID, *req.ResponsesToolMessage.CallID)
 			}
 		}
 	}
 	defer func() {
-		if tracer == nil || opSpanHandle == nil {
+		if tracer == nil {
 			return
 		}
-		if finalResponse != nil {
-			// Tool-execution (CallTool) latency, so the metric measures it, not span wall-time.
-			if finalResponse.ExtraFields.Latency > 0 {
-				tracer.SetAttribute(opSpanHandle, schemas.AttrBifrostMCPToolDurationMs, finalResponse.ExtraFields.Latency)
-			}
-			if req != nil && req.RequestType.IsExecuteTool() {
-				if data, err := schemas.MarshalString(finalResponse); err == nil {
-					tracer.SetAttribute(opSpanHandle, schemas.AttrToolCallResult, data)
-				}
+		// Tool-call result captured via named returns — set just before EndSpan so the
+		// attribute lands on the open span before it's frozen.
+		if finalResponse != nil && req != nil && req.RequestType.IsExecuteTool() {
+			if data, err := schemas.MarshalString(finalResponse); err == nil {
+				tracer.SetAttribute(spanHandle, schemas.AttrToolCallResult, data)
 			}
 		}
-		setMCPGovernanceSpanAttrs(tracer, opSpanHandle, ctx)
 		if finalError != nil {
 			msg := ""
 			if finalError.Error != nil {
 				msg = finalError.Error.Message
 			}
-			tracer.SetAttribute(opSpanHandle, schemas.AttrErrorTypeSpec, mcpErrorType(finalError))
-			tracer.EndSpan(opSpanHandle, schemas.SpanStatusError, msg)
+			tracer.EndSpan(spanHandle, schemas.SpanStatusError, msg)
 		} else {
-			tracer.EndSpan(opSpanHandle, schemas.SpanStatusOk, "")
+			tracer.EndSpan(spanHandle, schemas.SpanStatusOk, "")
 		}
 	}()
 
-	// No pipeline configured → run the op directly under its own span, no hooks.
+	// MCP request type stamped on every wrapped BifrostError so downstream gates
+	// (governance, logging) can discriminate execute-tool calls from ping/list_tools.
+	mcpReqType := schemas.MCPRequestType("")
+	if req != nil {
+		mcpReqType = req.RequestType
+	}
+
+	// No pipeline configured → run the op directly, no hooks (but span still recorded).
 	pipeline := m.GetPluginPipeline()
 	if pipeline == nil {
-		startOpSpan(req)
 		resp, opErr := op(req)
 		if opErr != nil {
 			return resp, &schemas.BifrostError{
 				IsBifrostError: false,
-				Error:          &schemas.ErrorField{Message: opErr.Error(), Error: opErr},
+				Error:          &schemas.ErrorField{Message: opErr.Error()},
 				ExtraFields:    schemas.BifrostErrorExtraFields{MCPRequestType: mcpReqType},
 			}
 		}
@@ -169,8 +130,7 @@ func (m *MCPManager) RunWithPluginPipeline(
 	}
 	defer m.ReleasePluginPipeline(pipeline)
 
-	// PreHooks. preReq is the (possibly mutated) request for the op. Their spans chain under
-	// the /mcp HTTP span — no op span exists yet.
+	// PreHooks. preReq is the (possibly mutated) request that must flow to the op.
 	preReq, shortCircuit, preCount := pipeline.RunMCPPreHooks(ctx, req)
 
 	// Pull attribution from the request so short-circuit responses still carry
@@ -186,7 +146,7 @@ func (m *MCPManager) RunWithPluginPipeline(
 	}
 
 	if shortCircuit != nil {
-		// Short-circuit: the wire op never runs, so no op span is created. PostHooks still run.
+		// Short-circuit with response — still run PostHooks for plugins that ran.
 		if shortCircuit.Response != nil {
 			shortCircuit.Response.PopulateExtraFields(mcpReqType, clientName, toolName)
 			finalResp, finalErr := pipeline.RunMCPPostHooks(ctx, shortCircuit.Response, nil, preCount)
@@ -222,23 +182,18 @@ func (m *MCPManager) RunWithPluginPipeline(
 		}
 	}
 
-	// Op span created after the PreHooks so it nests under the last PreHook; PostHooks nest
-	// under it.
-	startOpSpan(preReq)
-
 	// Run the actual wire op with the mutated request.
 	resp, opErr := op(preReq)
 	if resp != nil {
 		resp.PopulateExtraFields(mcpReqType, clientName, toolName)
 	}
 
-	// Wrap opErr so PostHooks see a typed error. Keep the original on ErrorField.Error
-	// (json:"-") so mcpErrorType classifies it via errors.Is.
+	// Wrap opErr as BifrostError so PostHooks see a typed error.
 	var bErr *schemas.BifrostError
 	if opErr != nil {
 		bErr = &schemas.BifrostError{
 			IsBifrostError: false,
-			Error:          &schemas.ErrorField{Message: opErr.Error(), Error: opErr},
+			Error:          &schemas.ErrorField{Message: opErr.Error()},
 			ExtraFields:    schemas.BifrostErrorExtraFields{MCPRequestType: mcpReqType},
 		}
 	}
@@ -269,7 +224,7 @@ func (m *MCPManager) runConnectWithPluginPipeline(
 	ctx *schemas.BifrostContext,
 	req *schemas.BifrostMCPConnectRequest,
 	op MCPConnectOpFunc,
-) (finalResponse *schemas.BifrostMCPConnectResponse, finalError *schemas.BifrostError) {
+) (*schemas.BifrostMCPConnectResponse, *schemas.BifrostError) {
 	if ctx != nil {
 		if _, ok := ctx.Value(schemas.BifrostContextKeyRequestID).(string); !ok {
 			ctx.SetValue(schemas.BifrostContextKeyRequestID, uuid.New().String())
@@ -281,59 +236,25 @@ func (m *MCPManager) runConnectWithPluginPipeline(
 		clientName = req.ClientName
 	}
 
-	// Span layout mirrors RunWithPluginPipeline: connect span created after the PreConnection
-	// hooks, nesting under the last one; PostConnection hooks nest under it. Connect is the
-	// MCP "initialize" method.
+	// Outer span so traces show one row per Connect op.
 	tracer, _ := ctx.Value(schemas.BifrostContextKeyTracer).(schemas.Tracer)
-
-	var connSpanHandle schemas.SpanHandle
-	startConnectSpan := func(r *schemas.BifrostMCPConnectRequest) {
-		if tracer == nil {
-			return
-		}
-		name := clientName
-		if r != nil && r.ClientName != "" {
-			name = r.ClientName
-		}
+	var spanHandle schemas.SpanHandle
+	if tracer != nil {
 		spanName := "mcp.connect"
-		if name != "" {
-			spanName = fmt.Sprintf("%s.%s", spanName, name)
+		if clientName != "" {
+			spanName = fmt.Sprintf("%s.%s", spanName, clientName)
 		}
-		spanCtx, handle := tracer.StartSpan(ctx, spanName, schemas.SpanKindMCPClient)
-		connSpanHandle = handle
-		if spanCtx != nil {
-			if id, ok := spanCtx.Value(schemas.BifrostContextKeySpanID).(string); ok && id != "" {
-				ctx.SetValue(schemas.BifrostContextKeySpanID, id)
-			}
-		}
-		tracer.SetAttribute(handle, schemas.AttrMCPMethodName, "initialize")
-		if r != nil {
-			if transport := r.ConnectionType.OTelNetworkTransport(); transport != "" {
-				tracer.SetAttribute(handle, schemas.AttrNetworkTransport, transport)
-			}
-		}
+		_, spanHandle = tracer.StartSpan(ctx, spanName, schemas.SpanKindMCPClient)
 	}
 	defer func() {
-		if tracer == nil || connSpanHandle == nil {
-			return
-		}
-		setMCPGovernanceSpanAttrs(tracer, connSpanHandle, ctx)
-		if finalError != nil {
-			msg := ""
-			if finalError.Error != nil {
-				msg = finalError.Error.Message
-			}
-			tracer.SetAttribute(connSpanHandle, schemas.AttrErrorTypeSpec, mcpErrorType(finalError))
-			tracer.EndSpan(connSpanHandle, schemas.SpanStatusError, msg)
-		} else {
-			tracer.EndSpan(connSpanHandle, schemas.SpanStatusOk, "")
+		if tracer != nil {
+			tracer.EndSpan(spanHandle, schemas.SpanStatusOk, "")
 		}
 	}()
 
-	// No pipeline configured → run the op directly under its own span.
+	// No pipeline configured → run the op directly.
 	pipeline := m.GetPluginPipeline()
 	if pipeline == nil {
-		startConnectSpan(req)
 		resp, opErr := op(req)
 		if opErr != nil {
 			return resp, &schemas.BifrostError{
@@ -380,9 +301,6 @@ func (m *MCPManager) runConnectWithPluginPipeline(
 			Error:          &schemas.ErrorField{Message: "Connect request after plugin hooks cannot be nil"},
 		}
 	}
-
-	// Connect span created after the PreConnection hooks so they nest under it.
-	startConnectSpan(preReq)
 
 	resp, opErr := op(preReq)
 	if resp != nil {
@@ -446,11 +364,7 @@ func (m *MCPManager) runListToolsWithHooks(ctx context.Context, conn *client.Cli
 	start := time.Now()
 
 	resp, bErr := m.RunWithPluginPipeline(gateCtx, req, func(preReq *schemas.BifrostMCPRequest) (*schemas.BifrostMCPResponse, error) {
-		// Use gateCtx (not the outer ctx) so values a PreMCPHook wrote during the
-		// gate — notably BifrostContextKeyMCPExtraHeaders — are visible to the wire
-		// call. BifrostContext.Value walks parent-ward only, so the outer ctx cannot
-		// see writes made to its gateCtx child.
-		detailed, opErr := retrieveExternalToolsDetailed(gateCtx, conn, clientName, m.logger)
+		detailed, opErr := retrieveExternalToolsDetailed(ctx, conn, clientName, m.logger)
 		if opErr != nil {
 			return nil, opErr
 		}
@@ -491,9 +405,7 @@ func (chm *ClientHealthMonitor) runPingWithHooks(ctx context.Context, conn *clie
 	gateCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
 	start := time.Now()
 	_, bErr := chm.manager.RunWithPluginPipeline(gateCtx, req, func(preReq *schemas.BifrostMCPRequest) (*schemas.BifrostMCPResponse, error) {
-		// Use gateCtx so a PreMCPHook's context writes (e.g. BifrostContextKeyMCPExtraHeaders)
-		// reach the transport headerFunc on this ping. See runListToolsWithHooks for details.
-		if pingErr := conn.Ping(gateCtx); pingErr != nil {
+		if pingErr := conn.Ping(ctx); pingErr != nil {
 			return nil, pingErr
 		}
 		return &schemas.BifrostMCPResponse{
@@ -507,63 +419,4 @@ func (chm *ClientHealthMonitor) runPingWithHooks(ctx context.Context, conn *clie
 		return fmt.Errorf("ping failed: %s", bErr.GetErrorString())
 	}
 	return nil
-}
-
-// connectionTypeForClientName resolves a client's transport by name. Returns "" when no
-// live client matches (per-user/ephemeral connections), so callers omit the attribute.
-func (m *MCPManager) connectionTypeForClientName(name string) schemas.MCPConnectionType {
-	if name == "" {
-		return ""
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, state := range m.clientMap {
-		// Match on ExecutionConfig.Name, as GetClientByName does.
-		if state != nil && state.ExecutionConfig != nil && state.ExecutionConfig.Name == name {
-			return state.ExecutionConfig.ConnectionType
-		}
-	}
-	return ""
-}
-
-// mcpErrorType classifies a failed MCP op into a low-cardinality error.type for the
-// metric (_OTHER is the OTel catch-all). Best-effort: an error swapped by a PostHook
-// degrades to _OTHER.
-func mcpErrorType(bErr *schemas.BifrostError) string {
-	if bErr == nil {
-		return "_OTHER"
-	}
-	if bErr.ExtraFields.MCPAuthRequired != nil {
-		return "auth_required"
-	}
-	if bErr.Error != nil && bErr.Error.Error != nil {
-		switch {
-		case errors.Is(bErr.Error.Error, ErrMCPToolTimeout):
-			return "timeout"
-		case errors.Is(bErr.Error.Error, ErrMCPToolCallFailed):
-			return "tool_error"
-		}
-	}
-	return "_OTHER"
-}
-
-// setMCPGovernanceSpanAttrs copies the metric-safe bifrost.* governance identity from
-// context onto an MCP span for per-tenant metric breakdowns. Absent dims are skipped.
-func setMCPGovernanceSpanAttrs(tracer schemas.Tracer, handle schemas.SpanHandle, ctx *schemas.BifrostContext) {
-	if tracer == nil || ctx == nil {
-		return
-	}
-	setIfPresent := func(ctxKey schemas.BifrostContextKey, attrKey string) {
-		if v, ok := ctx.Value(ctxKey).(string); ok && v != "" {
-			tracer.SetAttribute(handle, attrKey, v)
-		}
-	}
-	setIfPresent(schemas.BifrostContextKeyGovernanceVirtualKeyID, schemas.AttrBifrostVirtualKeyID)
-	setIfPresent(schemas.BifrostContextKeyGovernanceVirtualKeyName, schemas.AttrBifrostVirtualKeyName)
-	setIfPresent(schemas.BifrostContextKeyGovernanceTeamID, schemas.AttrBifrostTeamID)
-	setIfPresent(schemas.BifrostContextKeyGovernanceTeamName, schemas.AttrBifrostTeamName)
-	setIfPresent(schemas.BifrostContextKeyGovernanceCustomerID, schemas.AttrBifrostCustomerID)
-	setIfPresent(schemas.BifrostContextKeyGovernanceCustomerName, schemas.AttrBifrostCustomerName)
-	setIfPresent(schemas.BifrostContextKeyGovernanceBusinessUnitID, schemas.AttrBifrostBusinessUnitID)
-	setIfPresent(schemas.BifrostContextKeyGovernanceBusinessUnitName, schemas.AttrBifrostBusinessUnitName)
 }

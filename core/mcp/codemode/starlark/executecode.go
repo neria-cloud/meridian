@@ -134,10 +134,6 @@ func (s *StarlarkCodeMode) handleExecuteToolCode(ctx *schemas.BifrostContext, to
 	var responseText string
 	var executionSuccess bool = true
 	if result.Errors != nil {
-		// A sandbox run that raised is a tool failure, not a result. Without the
-		// marker the traceback below reaches the provider as an ordinary tool
-		// result and the model reads it as a genuine answer.
-		executionSuccess = false
 		s.logger.Debug("%s Formatting error response. Error kind: %s, Message length: %d, Hints count: %d", codemcp.CodeModeLogPrefix, result.Errors.Kind, len(result.Errors.Message), len(result.Errors.Hints))
 		logsText := ""
 		if len(result.Logs) > 0 {
@@ -200,9 +196,7 @@ func (s *StarlarkCodeMode) handleExecuteToolCode(ctx *schemas.BifrostContext, to
 	}
 
 	s.logger.Debug("%s Returning tool response message. Execution success: %v", codemcp.CodeModeLogPrefix, executionSuccess)
-	// A failed sandbox run already reports the failure in responseText, but without
-	// the marker the model reads that text as an ordinary result.
-	return createToolResponseMessage(toolCall, responseText, !executionSuccess), nil
+	return createToolResponseMessage(toolCall, responseText), nil
 }
 
 // executeCode executes Python (Starlark) code in a sandboxed interpreter with MCP tool bindings.
@@ -484,6 +478,11 @@ func (s *StarlarkCodeMode) callMCPTool(ctx *schemas.BifrostContext, clientName, 
 	}
 	defer release()
 
+	reqHeaders, err := s.credStore.RequestHeaders(nestedCtx, client.ExecutionConfig)
+	if err != nil {
+		return nil, err
+	}
+
 	toolExecutionTimeout := s.getToolExecutionTimeout()
 
 	// Delegate to the canonical plugin gate. RunWithPluginPipeline owns the
@@ -520,10 +519,6 @@ func (s *StarlarkCodeMode) callMCPTool(ctx *schemas.BifrostContext, clientName, 
 		toolCtx, cancel := context.WithTimeout(nestedCtx, toolExecutionTimeout)
 		defer cancel()
 
-		// Per-request extra headers (BifrostContextKeyMCPExtraHeaders) are injected
-		// uniformly by the transport headerFunc (see createHTTPConnection /
-		// createSSEConnection / AcquireClientConn), so no per-call Header is set here.
-		// Keeps nested codemode calls on the same single header path as the gateway.
 		callRequest := mcp.CallToolRequest{
 			Request: mcp.Request{
 				Method: string(mcp.MethodToolsCall),
@@ -532,6 +527,7 @@ func (s *StarlarkCodeMode) callMCPTool(ctx *schemas.BifrostContext, clientName, 
 				Name:      effectiveToolName,
 				Arguments: effectiveArgs,
 			},
+			Header: reqHeaders,
 		}
 
 		toolResponse, callErr := conn.CallTool(toolCtx, callRequest)
@@ -557,11 +553,8 @@ func (s *StarlarkCodeMode) callMCPTool(ctx *schemas.BifrostContext, clientName, 
 		logToolName := strings.ReplaceAll(effectiveToolName, "-", "_")
 		appendLog(fmt.Sprintf("[TOOL] %s.%s raw response: %s", clientName, logToolName, resultStr))
 
-		// The "Error: " prefix check above catches results a server renders as text;
-		// this carries the protocol-level flag (mcp.CallToolResult.IsError) for
-		// servers that set it instead. Nil-guarded to match extractTextFromMCPResponse.
 		return &schemas.BifrostMCPResponse{
-			ChatMessage: createToolResponseMessage(toolCallReq, rawResult, toolResponse != nil && toolResponse.IsError),
+			ChatMessage: createToolResponseMessage(toolCallReq, rawResult),
 			ExtraFields: schemas.BifrostMCPResponseExtraFields{
 				ClientName: clientName,
 				ToolName:   effectiveToolName,

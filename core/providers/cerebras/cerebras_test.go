@@ -25,12 +25,12 @@ func TestCerebras(t *testing.T) {
 
 	testConfig := llmtests.ComprehensiveTestConfig{
 		Provider:  schemas.Cerebras,
-		ChatModel: "gpt-oss-120b",
+		ChatModel: "llama3.1-8b",
 		Fallbacks: []schemas.Fallback{
+			{Provider: schemas.Cerebras, Model: "llama3.1-8b"},
 			{Provider: schemas.Cerebras, Model: "gpt-oss-120b"},
-			{Provider: schemas.Cerebras, Model: "zai-glm-4.7"},
 		},
-		TextModel:      "gpt-oss-120b",
+		TextModel:      "llama3.1-8b",
 		EmbeddingModel: "", // Cerebras doesn't support embedding
 		ReasoningModel: "gpt-oss-120b",
 		Scenarios: llmtests.TestScenarios{
