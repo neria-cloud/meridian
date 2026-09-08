@@ -263,6 +263,10 @@ github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D
 github.com/mattn/go-sqlite3 v1.14.32 h1:JD12Ag3oLy1zQA+BNn74xRgaBbdhbNIDYvQUEuuErjs=
 github.com/mattn/go-sqlite3 v1.14.32/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
 github.com/montanaflynn/stats v0.0.0-20171201202039-1bf9dbcd8cbe/go.mod h1:wL8QJuTMNUDYhXwkmfOly8iTdp5TEcJFWZD2D7SIkUc=
+github.com/neria-cloud/meridian/core v1.7.13 h1:iqBgFuyfQBi9712T092RuIN4/q0Rm6P/dNljQQMflwc=
+github.com/neria-cloud/meridian/core v1.7.13/go.mod h1:GH0n4OeKysCynE20StQCmlIGqB1SdxomR1k37C0u5S0=
+github.com/neria-cloud/meridian/framework v1.5.10 h1:JIEt6HJ6B6AtxMGKpHD0YKgUWqbLu7ERLFzW88sqgyI=
+github.com/neria-cloud/meridian/framework v1.5.10/go.mod h1:xg8HKnR+xb/H6b6tdw9uvOEVArOT4okIviNOATtBvOE=
 github.com/oapi-codegen/runtime v1.1.1 h1:EXLHh0DXIJnWhdRPN2w4MXAzFyE4CskzhNLUmtpMYro=
 github.com/oapi-codegen/runtime v1.1.1/go.mod h1:SK9X900oXmPWilYR5/WKPzt3Kqxn/uS/+lbpREv+eCg=
 github.com/oklog/ulid v1.3.1 h1:EGfNDEx6MqHz8B3uNV6QAib1UR2Lm97sHi3ocA6ESJ4=
