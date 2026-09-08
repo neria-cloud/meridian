@@ -29,5 +29,3 @@ require (
 	golang.org/x/sys v0.39.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/neria-cloud/meridian/core => /Users/speckzzz/reps/agent01/neria/meridian-public-src/core
