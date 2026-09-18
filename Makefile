@@ -76,6 +76,7 @@ all: help
 include recipes/fly.mk
 include recipes/ecs.mk
 include recipes/local-k8s.mk
+include recipes/meridian.mk
 
 # Default target
 help: ## Show this help message
