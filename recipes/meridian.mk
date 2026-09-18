@@ -1,0 +1,6 @@
+# Meridian additions (patchset estimate-cost); included from the Makefile.
+.PHONY: test-functional test-functional-pg
+test-functional: ## Functional tests of the patchset APIs against the working tree (no Docker)
+	cd tests/functional && GOWORK=$(CURDIR)/tests/functional/go.work GOFLAGS=-mod=readonly go test -race -count=1 ./...
+test-functional-pg: ## Same plus the PostgreSQL-backed tests (Docker)
+	cd tests/functional && GOWORK=$(CURDIR)/tests/functional/go.work GOFLAGS=-mod=readonly go test -race -count=1 -tags pg ./...

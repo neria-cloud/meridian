@@ -1,0 +1,34 @@
+# Meridian's own quality gate (hand-maintained; not part of any patchset).
+# Runs the functional tests the estimate-cost patchset brings (tests/functional,
+# resolved through its committed go.work against the working tree) on every
+# pull request and tag, so a release branch cannot merge with red tests
+# regardless of what bifrost-prep did.
+name: meridian-tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    tags: ['**']
+
+concurrency:
+  group: meridian-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  functional:
+    name: functional
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: framework/go.mod
+          cache-dependency-path: |
+            framework/go.sum
+            tests/functional/go.sum
+      - name: functional tests
+        run: make test-functional
+      - name: vet framework
+        run: cd framework && go vet ./...
