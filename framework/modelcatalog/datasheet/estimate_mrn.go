@@ -19,24 +19,33 @@ const (
 	EstimateZero    EstimateSource = "zero_rate" // row resolved, every applicable rate is 0
 )
 
-// EstimateOptions carries the caller's fallbacks for models without a base
-// entry (custom prices only); 0 means the 4096 default.
+// EstimateOptions carries the caller's bounds and the units the estimator
+// cannot measure itself. Zero keeps the default behaviour for every field.
 type EstimateOptions struct {
-	FallbackInputTokens  int
+	FallbackInputTokens  int // models without a base entry (custom prices only); 0 → 4096
 	FallbackOutputTokens int
+
+	TranscriptionSeconds int // STT audio length; 0 → Source zero_rate (the caller's sentinel)
+	VideoSeconds         int // clip length when the request carries none; 0 → the provider API default
+	ImageTokens          int // tokens per image part on rows without a per-image dollar rate
+	AudioSeconds         int // summed audio input length of the prompt
+	AudioTokensPerSecond int // converts AudioSeconds to tokens on token-priced rows
+	FileTokens           int // token bound of the prompt's file parts
 }
 
 const defaultTokenBound = 4096
 
 // Estimate is the worst-case cost of one request before the provider call.
 type Estimate struct {
-	Cost            float64
-	Source          EstimateSource
-	MaxInputTokens  int  // Tier-1 bound used (0 for per-unit)
-	MaxOutputTokens int  // Tier-1 bound used (0 for per-unit)
-	BoundsFromEntry bool // false when the fallbacks priced an override-only model
-	Tier            string
-	Surcharges      float64
+	Cost             float64
+	Source           EstimateSource
+	MaxInputTokens   int  // Tier-1 bound used (0 for per-unit)
+	MaxOutputTokens  int  // Tier-1 bound used (0 for per-unit)
+	BoundsFromEntry  bool // false when the fallbacks priced an override-only model
+	Tier             string
+	Surcharges       float64 // dollar part not bound to tokens (web search, per-image, per-second audio)
+	MultimodalTokens int     // image / audio / file tokens priced with the input bound
+	MediaSeconds     int     // audio or video seconds the per-unit tier priced
 }
 
 // EstimateMaxCost prices the worst case of request through the same
@@ -61,31 +70,50 @@ func (s *Store) EstimateMaxCost(request *schemas.BifrostRequest, provider, model
 	switch rt {
 	case schemas.ImageGenerationRequest, schemas.ImageEditRequest, schemas.ImageVariationRequest,
 		schemas.SpeechRequest, schemas.VideoGenerationRequest, schemas.VideoRemixRequest:
-		in, ok := perUnitInput(request, rt)
+		in, ok := perUnitInput(request, rt, opts)
 		if !ok {
 			return Estimate{}
 		}
 		cost := s.computeCostFromInput(in, ri, rt, sc)
+		est := Estimate{Cost: cost, Source: EstimatePerUnit, Tier: "per_unit"}
+		if in.videoSeconds != nil {
+			est.MediaSeconds = *in.videoSeconds
+		}
 		if cost <= 0 {
+			est.Source = EstimateZero
+		}
+		return est
+	case schemas.TranscriptionRequest:
+		// The audio length is the caller's (a container probe or a default); without it the caller applies its sentinel.
+		if opts.TranscriptionSeconds <= 0 {
 			return Estimate{Source: EstimateZero}
 		}
-		return Estimate{Cost: cost, Source: EstimatePerUnit}
-	case schemas.TranscriptionRequest:
-		// TODO(not planned): STT input is unknown pre-call (the audio is not decoded); Source Zero lets the caller apply its sentinel (N1).
-		return Estimate{Source: EstimateZero}
+		seconds := opts.TranscriptionSeconds
+		cost := s.computeCostFromInput(costInput{audioSeconds: &seconds}, ri, rt, sc)
+		if cost <= 0 && opts.AudioTokensPerSecond > 0 {
+			// Rows priced per audio token only: the duration becomes tokens.
+			cost = float64(seconds*opts.AudioTokensPerSecond) * tieredAudioTokenInputRate(pricing, 0, serviceTier{})
+		}
+		est := Estimate{Cost: cost, Source: EstimatePerUnit, Tier: "per_unit", MediaSeconds: seconds}
+		if cost <= 0 {
+			est.Source = EstimateZero
+		}
+		return est
 	}
 
 	maxIn, maxOut, fromEntry := tokenBounds(request, rt, pricing, opts)
 	usage := &schemas.BifrostLLMUsage{PromptTokens: maxIn, CompletionTokens: maxOut, TotalTokens: maxIn + maxOut}
-	est := Estimate{MaxInputTokens: maxIn, MaxOutputTokens: maxOut, BoundsFromEntry: fromEntry, Tier: "base"}
+	mm, mmDollars := multimodalTokens(request, rt, pricing, opts)
+	est := Estimate{MaxInputTokens: maxIn, MaxOutputTokens: maxOut, BoundsFromEntry: fromEntry, Tier: "base", MultimodalTokens: mm.total()}
 	// Every tier the provider may bill is priced; the highest bounds the reservation.
 	for _, c := range tierCandidates(request, rt) {
 		cost := s.computeCostFromInput(costInput{usage: usage, tier: c.tier}, ri, rt, sc)
+		cost += mm.cost(pricing, maxIn+maxOut+mm.total(), c.tier)
 		if cost > est.Cost {
 			est.Cost, est.Tier = cost, c.name
 		}
 	}
-	est.Surcharges = estimateSurcharges(request, rt, pricing)
+	est.Surcharges = mmDollars + estimateSurcharges(request, rt, pricing)
 	est.Cost += est.Surcharges
 	if est.Cost <= 0 {
 		est.Source = EstimateZero
@@ -145,19 +173,62 @@ func tierCandidates(request *schemas.BifrostRequest, rt schemas.RequestType) []t
 }
 
 // estimateSurcharges adds the per-request costs Tier 1's token math misses:
-// one web-search query when the request enables search, and per-image input
-// pricing for every image part of the prompt.
+// one web-search query when the request enables search.
 func estimateSurcharges(request *schemas.BifrostRequest, rt schemas.RequestType, pricing *configstoreTables.TableModelPricing) float64 {
-	sur := 0.0
 	// TODO(not planned): one web-search query per request is assumed; the real count is known only after the call (N13).
 	if pricing.SearchContextCostPerQuery != nil && hasWebSearch(request, rt) {
-		sur += *pricing.SearchContextCostPerQuery
+		return *pricing.SearchContextCostPerQuery
 	}
-	// TODO(not planned): token-priced image inputs need the image dimensions, unknown pre-call (N16).
-	if pricing.InputCostPerImage != nil {
-		sur += float64(countImageParts(request, rt)) * *pricing.InputCostPerImage
+	return 0
+}
+
+// mmTokens is the token bound of the prompt's non-text parts, split by the
+// rate each share is priced at.
+type mmTokens struct {
+	image int // InputCostPerImageToken, else the input rate
+	audio int // InputCostPerAudioToken, else the input rate
+	text  int // the input rate (files, audio without a token rate)
+}
+
+func (m mmTokens) total() int { return m.image + m.audio + m.text }
+
+func (m mmTokens) cost(pricing *configstoreTables.TableModelPricing, totalTokens int, tier serviceTier) float64 {
+	inputRate := tieredInputRate(pricing, totalTokens, tier)
+	imageRate, audioRate := inputRate, inputRate
+	if pricing.InputCostPerImageToken != nil {
+		imageRate = *pricing.InputCostPerImageToken
 	}
-	return sur
+	if pricing.InputCostPerAudioToken != nil {
+		audioRate = *pricing.InputCostPerAudioToken
+	}
+	return float64(m.image)*imageRate + float64(m.audio)*audioRate + float64(m.text)*inputRate
+}
+
+// multimodalTokens turns the caller's units into tokens priced with the text
+// bound and dollars for rows priced per image or per audio second. A row with
+// a per-image dollar rate keeps it; every other image part is ImageTokens.
+func multimodalTokens(request *schemas.BifrostRequest, rt schemas.RequestType, pricing *configstoreTables.TableModelPricing, opts EstimateOptions) (mmTokens, float64) {
+	var mm mmTokens
+	dollars := 0.0
+	if images := countImageParts(request, rt); images > 0 {
+		if pricing.InputCostPerImage != nil {
+			dollars += float64(images) * *pricing.InputCostPerImage
+		} else {
+			mm.image += images * opts.ImageTokens
+		}
+	}
+	if opts.AudioSeconds > 0 {
+		switch {
+		case pricing.InputCostPerAudioToken != nil:
+			mm.audio += opts.AudioSeconds * opts.AudioTokensPerSecond
+		case pricing.InputCostPerAudioPerSecond != nil:
+			dollars += float64(opts.AudioSeconds) * *pricing.InputCostPerAudioPerSecond
+		default:
+			mm.text += opts.AudioSeconds * opts.AudioTokensPerSecond
+		}
+	}
+	mm.text += opts.FileTokens
+	return mm, dollars
 }
 
 const webSearchToolPrefix = "web_search"
@@ -278,7 +349,7 @@ func orDefault(n int) int {
 
 // perUnitInput builds the costInput of a per-unit request from its params;
 // ok is false when the billable unit is unknown before the call.
-func perUnitInput(request *schemas.BifrostRequest, rt schemas.RequestType) (costInput, bool) {
+func perUnitInput(request *schemas.BifrostRequest, rt schemas.RequestType, opts EstimateOptions) (costInput, bool) {
 	switch rt {
 	case schemas.ImageGenerationRequest, schemas.ImageEditRequest, schemas.ImageVariationRequest:
 		n, size, quality := estimateImageParams(request)
@@ -293,7 +364,7 @@ func perUnitInput(request *schemas.BifrostRequest, rt schemas.RequestType) (cost
 		}
 		return costInput{audioTextInputChars: utf8.RuneCountInString(request.SpeechRequest.Input.Input)}, true
 	case schemas.VideoGenerationRequest, schemas.VideoRemixRequest:
-		seconds, ok := videoSecondsForEstimate(request)
+		seconds, ok := videoSecondsForEstimate(request, opts)
 		if !ok {
 			return costInput{}, false
 		}
@@ -345,8 +416,9 @@ func estimateImageParams(request *schemas.BifrostRequest) (n int, size, quality 
 }
 
 // videoSecondsForEstimate returns the clip length to price: the request's
-// seconds, else the provider's API default (Gemini/Vertex 8, OpenAI 4).
-func videoSecondsForEstimate(request *schemas.BifrostRequest) (int, bool) {
+// seconds, else the caller's default, else the provider's API default
+// (Gemini/Vertex 8, OpenAI 4).
+func videoSecondsForEstimate(request *schemas.BifrostRequest, opts EstimateOptions) (int, bool) {
 	var provider schemas.ModelProvider
 	var explicit *string
 	switch {
@@ -363,6 +435,9 @@ func videoSecondsForEstimate(request *schemas.BifrostRequest) (int, bool) {
 	if explicit != nil {
 		n, err := strconv.Atoi(*explicit)
 		return n, err == nil && n > 0
+	}
+	if opts.VideoSeconds > 0 {
+		return opts.VideoSeconds, true
 	}
 	switch provider {
 	case schemas.Gemini, schemas.Vertex:

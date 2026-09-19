@@ -388,3 +388,85 @@ func TestEstimateMaxCost_Tier1_ZeroRates(t *testing.T) {
 	assert.Equal(t, 0.0, est.Cost)
 	assert.Equal(t, 4096, est.MaxInputTokens)
 }
+
+func TestEstimateMaxCost_Transcription_CallerSeconds(t *testing.T) {
+	t.Parallel()
+	s := NewTestStore(nil)
+	s.SeedPricingForTest("stt-sec", "openai", schemas.TranscriptionRequest, configstoreTables.TableModelPricing{
+		Model: "stt-sec", Provider: "openai", Mode: "audio_transcription", InputCostPerAudioPerSecond: f64(1e-4)})
+	s.SeedPricingForTest("stt-tok", "openai", schemas.TranscriptionRequest, configstoreTables.TableModelPricing{
+		Model: "stt-tok", Provider: "openai", Mode: "audio_transcription", InputCostPerAudioToken: f64(1e-6)})
+	req := func(model string) *schemas.BifrostRequest {
+		return &schemas.BifrostRequest{RequestType: schemas.TranscriptionRequest,
+			TranscriptionRequest: &schemas.BifrostTranscriptionRequest{Provider: schemas.OpenAI, Model: model}}
+	}
+	perSecond := s.EstimateMaxCost(req("stt-sec"), "openai", "stt-sec", nil, EstimateOptions{TranscriptionSeconds: 120})
+	assert.Equal(t, EstimatePerUnit, perSecond.Source)
+	assert.InDelta(t, 120*1e-4, perSecond.Cost, 1e-12)
+	assert.Equal(t, 120, perSecond.MediaSeconds)
+
+	perToken := s.EstimateMaxCost(req("stt-tok"), "openai", "stt-tok", nil, EstimateOptions{TranscriptionSeconds: 60, AudioTokensPerSecond: 32})
+	assert.Equal(t, EstimatePerUnit, perToken.Source)
+	assert.InDelta(t, 60*32*1e-6, perToken.Cost, 1e-12)
+
+	assert.Equal(t, EstimateZero, s.EstimateMaxCost(req("stt-sec"), "openai", "stt-sec", nil, EstimateOptions{}).Source)
+	assert.Equal(t, EstimateZero, s.EstimateMaxCost(req("stt-tok"), "openai", "stt-tok", nil, EstimateOptions{TranscriptionSeconds: 60}).Source, "token row without a conversion rate")
+}
+
+func TestEstimateMaxCost_VideoGen_NoSeconds_CallerDefault(t *testing.T) {
+	t.Parallel()
+	s := NewTestStore(nil)
+	s.SeedPricingForTest("test-video", "runway", schemas.VideoGenerationRequest, videoRow("runway", 0.10))
+	s.SeedPricingForTest("test-video", "openai", schemas.VideoGenerationRequest, videoRow("openai", 0.10))
+	est := s.EstimateMaxCost(videoReq(schemas.ModelProvider("runway"), ""), "runway", "test-video", nil, EstimateOptions{VideoSeconds: 10})
+	assert.Equal(t, EstimatePerUnit, est.Source)
+	assert.InDelta(t, 1.0, est.Cost, 1e-9)
+	assert.Equal(t, 10, est.MediaSeconds)
+	assert.InDelta(t, 0.50, s.EstimateMaxCost(videoReq(schemas.OpenAI, "5"), "openai", "test-video", nil, EstimateOptions{VideoSeconds: 10}).Cost, 1e-9, "explicit seconds win")
+	assert.InDelta(t, 0.40, s.EstimateMaxCost(videoReq(schemas.OpenAI, ""), "openai", "test-video", nil, EstimateOptions{}).Cost, 1e-9, "API default without a caller value")
+}
+
+func TestEstimateMaxCost_Tier1_MultimodalUnits(t *testing.T) {
+	t.Parallel()
+	s := NewTestStore(nil)
+	base := 1000*1e-6 + 100*2e-6
+	withImages := func(n int) *schemas.BifrostRequest {
+		req := chatReq("gpt-test", nil)
+		blocks := []schemas.ChatContentBlock{{Type: schemas.ChatContentBlockTypeText, Text: strp("describe")}}
+		for i := 0; i < n; i++ {
+			blocks = append(blocks, schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeImage})
+		}
+		req.ChatRequest.Input = []schemas.ChatMessage{{Content: &schemas.ChatMessageContent{ContentBlocks: blocks}}}
+		return req
+	}
+	units := EstimateOptions{ImageTokens: 1600, AudioTokensPerSecond: 32, AudioSeconds: 30, FileTokens: 10000}
+
+	imageTokenRow := chatRow(1e-6, 2e-6, 1000, 100)
+	imageTokenRow.InputCostPerImageToken = f64(5e-6)
+	imageTokenRow.InputCostPerAudioToken = f64(1e-5)
+	s.SeedPricingForTest("gpt-test", "openai", schemas.ChatCompletionRequest, imageTokenRow)
+	est := s.EstimateMaxCost(withImages(2), "openai", "gpt-test", nil, units)
+	assert.InDelta(t, base+2*1600*5e-6+30*32*1e-5+10000*1e-6, est.Cost, 1e-12)
+	assert.Equal(t, 2*1600+30*32+10000, est.MultimodalTokens)
+	assert.Equal(t, 0.0, est.Surcharges)
+
+	plainRow := chatRow(1e-6, 2e-6, 1000, 100)
+	s.SeedPricingForTest("gpt-plain", "openai", schemas.ChatCompletionRequest, plainRow)
+	req := withImages(1)
+	req.ChatRequest.Model = "gpt-plain"
+	est = s.EstimateMaxCost(req, "openai", "gpt-plain", nil, units)
+	assert.InDelta(t, base+(1600+30*32+10000)*1e-6, est.Cost, 1e-12, "input rate for every share")
+
+	perImageRow := chatRow(1e-6, 2e-6, 1000, 100)
+	perImageRow.InputCostPerImage = f64(0.002)
+	perImageRow.InputCostPerAudioPerSecond = f64(1e-3)
+	s.SeedPricingForTest("gpt-dollar", "openai", schemas.ChatCompletionRequest, perImageRow)
+	req.ChatRequest.Model = "gpt-dollar"
+	est = s.EstimateMaxCost(req, "openai", "gpt-dollar", nil, units)
+	assert.InDelta(t, base+0.002+30*1e-3+10000*1e-6, est.Cost, 1e-12, "dollar rates win over token defaults")
+	assert.InDelta(t, 0.002+30*1e-3, est.Surcharges, 1e-12)
+	assert.Equal(t, 10000, est.MultimodalTokens)
+
+	none := s.EstimateMaxCost(withImages(2), "openai", "gpt-test", nil, EstimateOptions{})
+	assert.InDelta(t, base, none.Cost, 1e-12, "zero units add nothing")
+}

@@ -76,3 +76,22 @@ func TestPerUnit_TranscriptionIsZero(t *testing.T) {
 	assert.Equal(t, modelcatalog.EstimateZero, est.Source)
 	assert.Equal(t, 0.0, est.Cost)
 }
+
+func TestPerUnit_TranscriptionCallerSeconds(t *testing.T) {
+	t.Parallel()
+	mc := fixtures.NewCatalog(t, fixtures.Row{Model: "stt", Provider: "openai", RequestType: schemas.TranscriptionRequest,
+		Pricing: tables.TableModelPricing{Mode: "audio_transcription", InputCostPerAudioPerSecond: f(1e-4)}})
+	est := mc.EstimateMaxCost(fixtures.Transcription(openai, "stt"), "openai", "stt", nil, modelcatalog.EstimateOptions{TranscriptionSeconds: 3600})
+	assert.Equal(t, modelcatalog.EstimatePerUnit, est.Source)
+	assert.InDelta(t, 0.36, est.Cost, 1e-9)
+	assert.Equal(t, 3600, est.MediaSeconds)
+}
+
+func TestPerUnit_VideoCallerDefault(t *testing.T) {
+	t.Parallel()
+	row := tables.TableModelPricing{Mode: "video_generation", OutputCostPerVideoPerSecond: f(0.10)}
+	mc := fixtures.NewCatalog(t, fixtures.Row{Model: "vid", Provider: "runway", RequestType: schemas.VideoGenerationRequest, Pricing: row})
+	est := mc.EstimateMaxCost(fixtures.Video(schemas.ModelProvider("runway"), "vid", ""), "runway", "vid", nil, modelcatalog.EstimateOptions{VideoSeconds: 10})
+	assert.Equal(t, modelcatalog.EstimatePerUnit, est.Source)
+	assert.InDelta(t, 1.0, est.Cost, 1e-9)
+}

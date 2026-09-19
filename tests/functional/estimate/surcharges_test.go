@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/neria-cloud/meridian/core/schemas"
+	"github.com/neria-cloud/meridian/framework/modelcatalog"
 	"github.com/neria-cloud/meridian/tests/functional/internal/fixtures"
 	"github.com/stretchr/testify/assert"
 )
@@ -33,4 +34,15 @@ func TestSurcharges_ImageParts(t *testing.T) {
 	est := mc.EstimateMaxCost(fixtures.ChatWithImages(openai, "gpt-test", 3), "openai", "gpt-test", nil, none)
 	assert.InDelta(t, 1000*1e-6+100*2e-6+3*0.002, est.Cost, 1e-12)
 	assert.InDelta(t, 0.006, est.Surcharges, 1e-12)
+}
+
+func TestSurcharges_MultimodalUnits(t *testing.T) {
+	t.Parallel()
+	row := chatRow(1e-6, 2e-6, 1000, 100)
+	row.InputCostPerImageToken = f(5e-6)
+	mc := chatCatalog(t, row)
+	units := modelcatalog.EstimateOptions{ImageTokens: 1600, AudioSeconds: 30, AudioTokensPerSecond: 32, FileTokens: 10000}
+	est := mc.EstimateMaxCost(fixtures.ChatWithImages(openai, "gpt-test", 3), "openai", "gpt-test", nil, units)
+	assert.InDelta(t, 1000*1e-6+100*2e-6+3*1600*5e-6+(30*32+10000)*1e-6, est.Cost, 1e-12)
+	assert.Equal(t, 3*1600+30*32+10000, est.MultimodalTokens)
 }
