@@ -1,0 +1,77 @@
+{
+  "$schema": "https://meridian.neria.cloud/schema",
+  "auth_config": { "is_enabled": false },
+  "cache": { "bind_addr": "0.0.0.0" },
+  "config_store": {
+    "enabled": true,
+    "type": "postgres",
+    "config": {
+      "host": "postgres", "port": "5432", "user": "meridian",
+      "password": "meridian", "db_name": "meridian", "ssl_mode": "disable"
+    }
+  },
+  "logs_store": {
+    "enabled": true,
+    "type": "postgres",
+    "config": {
+      "host": "postgres",
+      "port": "5432",
+      "user": "meridian",
+      "password": "meridian",
+      "db_name": "meridian",
+      "ssl_mode": "disable"
+    }
+  },
+  "authz": {
+    "access_audit_mode": "all"
+  },
+  "cluster_config": {
+    "enabled": true,
+    "peers": ["node1:7946", "node2:7946", "node3:7946"],
+    "region": "dev",
+    "gossip": {
+      "port": 7946,
+      "config": { "timeout_seconds": 5, "success_threshold": 1, "failure_threshold": 2 }
+    },
+    "raft": { "grpc_port": 9090, "reservation_ttl": "60s" }
+  },
+  "client": {
+    "drop_excess_requests": false,
+    "initial_pool_size": 100,
+    "allowed_origins": ["*"],
+    "enable_logging": true,
+    "enforce_governance_header": false,
+    "allow_direct_keys": false
+  },
+  "governance": {
+    "reservation": { "enabled": true, "default_mandatory": 0.05 }
+  },
+  "plugins": [
+    {
+      "enabled": true,
+      "name": "bifrost-mocker",
+      "config": {
+        "enabled": true,
+        "default_behavior": "passthrough",
+        "rules": [
+          {
+            "name": "deterministic-fake",
+            "enabled": true,
+            "priority": 100,
+            "conditions": { "providers": ["fake"] },
+            "responses": [
+              {
+                "type": "success",
+                "weight": 1.0,
+                "content": {
+                  "message": "mock response",
+                  "usage": { "prompt_tokens": 4000, "completion_tokens": 50, "total_tokens": 4050 }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
