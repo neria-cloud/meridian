@@ -1,0 +1,125 @@
+
+x-node-traefik-labels: &node-traefik-labels
+  traefik.enable: "true"
+  # Traefik's docker provider watches the whole daemon; the constraint below
+  # keys on this so a concurrent `make e2e` stack is not adopted as a backend.
+  meridian-dev-cluster: "true"
+  traefik.http.routers.meridian-api.rule: PathPrefix(`/api`) || PathPrefix(`/internal`) || PathPrefix(`/metrics`) || Path(`/ws`) || Path(`/health`)
+  traefik.http.routers.meridian-api.priority: "100"
+  traefik.http.routers.meridian-api.entrypoints: web
+  traefik.http.routers.meridian-api.service: meridian-api
+  traefik.http.services.meridian-api.loadbalancer.server.port: "8080"
+  # Readiness, without which round-robin cannot skip a node that is up but
+  # hosting nothing: a node parked awaiting re-admission still answers
+  # /internal/live, so roughly one request in three would come back 503.
+  traefik.http.services.meridian-api.loadbalancer.healthcheck.path: /internal/ready
+  traefik.http.services.meridian-api.loadbalancer.healthcheck.interval: 5s
+  traefik.http.services.meridian-api.loadbalancer.healthcheck.timeout: 3s
+  # The SPA. Load-balanced across all three rather than pinned to node1: every
+  # node runs the same image, so the embedded UI is byte-identical and its
+  # assets are content-hashed.
+  traefik.http.routers.meridian-ui.rule: PathPrefix(`/`)
+  traefik.http.routers.meridian-ui.priority: "1"
+  traefik.http.routers.meridian-ui.entrypoints: web
+  traefik.http.routers.meridian-ui.service: meridian-ui
+  traefik.http.services.meridian-ui.loadbalancer.server.port: "8080"
+  traefik.http.services.meridian-ui.loadbalancer.healthcheck.path: /internal/ready
+  traefik.http.services.meridian-ui.loadbalancer.healthcheck.interval: 5s
+  traefik.http.services.meridian-ui.loadbalancer.healthcheck.timeout: 3s
+
+services:
+  traefik:
+    image: traefik:v3.6
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      # Keep the service registered when every backend fails its readiness
+      # check: an all-unready cluster then answers 503 (the correct LB signal)
+      # instead of the route vanishing and falling through to 404.
+      - --providers.docker.allowEmptyServices=true
+      - --providers.docker.constraints=Label(`meridian-dev-cluster`,`true`)
+      - --entrypoints.web.address=:8082
+      - --api.dashboard=true
+      - --api.insecure=true
+    ports:
+      - "8082:8082"   # single entrypoint (UI + API + WS)
+      - "8090:8080"   # dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: meridian
+      POSTGRES_PASSWORD: meridian
+      POSTGRES_DB: meridian
+    ports: ["15433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meridian"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+
+  node1: &node
+    image: meridian-ent:latest
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      MERIDIAN_NODE_ID: node1
+      MERIDIAN_DATA_DIR: /app/data
+      LOG_LEVEL: debug
+      MERIDIAN_LICENSE_STR: ${MERIDIAN_LICENSE_STR:?set MERIDIAN_LICENSE_STR - clustering is licensed}
+      MERIDIAN_SEED_ADMIN: ${MERIDIAN_DEV_CLUSTER_SEED_ADMIN:-}
+      MERIDIAN_ENCRYPTION_KEY: ${MERIDIAN_DEV_ENCRYPTION_KEY:-meridian-dev-cluster-insecure-key}
+    volumes:
+      - ./data/config.json:/app/data/config.json:ro
+      - node1data:/app/data
+    ports: ["8091:8080"]
+    labels: *node-traefik-labels
+    healthcheck:
+      # Liveness only — independent of quorum, so a minority node is drained by
+      # Traefik's readiness check but NOT restarted by Docker.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/internal/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  node2:
+    <<: *node
+    environment:
+      MERIDIAN_NODE_ID: node2
+      MERIDIAN_DATA_DIR: /app/data
+      LOG_LEVEL: debug
+      MERIDIAN_LICENSE_STR: ${MERIDIAN_LICENSE_STR:?set MERIDIAN_LICENSE_STR}
+      MERIDIAN_SEED_ADMIN: ${MERIDIAN_DEV_CLUSTER_SEED_ADMIN:-}
+      MERIDIAN_ENCRYPTION_KEY: ${MERIDIAN_DEV_ENCRYPTION_KEY:-meridian-dev-cluster-insecure-key}
+    volumes:
+      - ./data/config.json:/app/data/config.json:ro
+      - node2data:/app/data
+    ports: ["8092:8080"]
+    labels: *node-traefik-labels
+
+  node3:
+    <<: *node
+    environment:
+      MERIDIAN_NODE_ID: node3
+      MERIDIAN_DATA_DIR: /app/data
+      LOG_LEVEL: debug
+      MERIDIAN_LICENSE_STR: ${MERIDIAN_LICENSE_STR:?set MERIDIAN_LICENSE_STR}
+      MERIDIAN_SEED_ADMIN: ${MERIDIAN_DEV_CLUSTER_SEED_ADMIN:-}
+      MERIDIAN_ENCRYPTION_KEY: ${MERIDIAN_DEV_ENCRYPTION_KEY:-meridian-dev-cluster-insecure-key}
+    volumes:
+      - ./data/config.json:/app/data/config.json:ro
+      - node3data:/app/data
+    ports: ["8093:8080"]
+    labels: *node-traefik-labels
+
+volumes:
+  pgdata:
+  node1data:
+  node2data:
+  node3data:
