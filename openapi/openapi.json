@@ -6,7 +6,7 @@
     "description": "Endpoints added by github.com/neria-cloud/meridian-overlay on top of the\nupstream Meridian API. This fragment is merged into the upstream\nspecification; the merged document is the single source consumers use.\n",
     "x-meridian-overlay": {
       "version": "1.6.2",
-      "upstream": "transports/v1.6.12-mrn.3"
+      "upstream": "transports/v1.6.12-mrn.4"
     }
   },
   "tags": [
