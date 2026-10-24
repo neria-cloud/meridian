@@ -2,11 +2,11 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Meridian API",
-    "version": "1.6.2",
+    "version": "1.6.3",
     "description": "Endpoints added by github.com/neria-cloud/meridian-overlay on top of the\nupstream Meridian API. This fragment is merged into the upstream\nspecification; the merged document is the single source consumers use.\n",
     "x-meridian-overlay": {
-      "version": "1.6.2",
-      "upstream": "transports/v1.6.12-mrn.4"
+      "version": "1.6.3",
+      "upstream": "transports/v1.6.12-mrn.5"
     }
   },
   "tags": [
@@ -8244,8 +8244,9 @@
       },
       "put": {
         "operationId": "updateConfig",
+        "x-access": "g-admin",
         "summary": "Update configuration",
-        "description": "Updates the Meridian configuration. Supports hot-reloading of certain settings\nlike drop_excess_requests. Some settings may require a restart to take effect.\n",
+        "description": "Updates the Meridian configuration. Supports hot-reloading of certain settings\nlike drop_excess_requests. Some settings may require a restart to take effect.\nIn air-gapped mode a change of `framework_config.pricing_url`,\n`model_parameters_url` or `mcp_library_url`, a reset to the default\nincluded, is refused with 409: catalog sources come from the\n`air_gapped` block (config.json or `MERIDIAN_AIR_GAPPED_*_URL`). A URL\nresent unchanged (blank counts as the default) is ignored, so it is never\nprobed. Other fields are unaffected.\n",
         "tags": [
           "Configuration"
         ],
@@ -8278,6 +8279,16 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "409": {
+            "description": "Air-gapped mode refuses a catalog URL change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AirGappedError"
+                }
+              }
+            }
+          },
           "500": {
             "$ref": "#/components/responses/InternalError"
           }
@@ -8289,7 +8300,7 @@
         "operationId": "getEdition",
         "x-access": "public",
         "summary": "Get edition info",
-        "description": "Returns the binary edition (`community` or `enterprise`), the active\nlicense (if loaded), and the current capability flags: `cluster`\n(multi-node topology operations, Pro and Enterprise), `sharding` (more\nthan one shard, shard management and customer migration, Enterprise),\n`guardrails` (Enterprise) and `max_directory_users` (the cap on active\nLDAP-sourced accounts: 20 community, 100 pro, 2000 enterprise). Public\nendpoint \u2014 no authentication required.\n",
+        "description": "Returns the binary edition (`community` or `enterprise`), the active\nlicense (if loaded), and the current capability flags: `cluster`\n(multi-node topology operations, Pro and Enterprise), `sharding` (more\nthan one shard, shard management and customer migration, Enterprise),\n`guardrails` (Enterprise) and `max_directory_users` (the cap on active\nLDAP-sourced accounts: 20 community, 100 pro, 2000 enterprise).\n`air_gapped` reports air-gapped mode (`air_gapped` in config.json or\n`MERIDIAN_AIR_GAPPED`); the web UI hides the onboarding checklist when it\nis true. Public endpoint \u2014 no authentication required.\n",
         "tags": [
           "Configuration"
         ],
@@ -8350,6 +8361,10 @@
                           "type": "integer"
                         }
                       }
+                    },
+                    "air_gapped": {
+                      "type": "boolean",
+                      "description": "Air-gapped mode is on; Meridian never contacts meridian.neria.cloud."
                     }
                   }
                 }
@@ -18435,6 +18450,50 @@
         }
       }
     },
+    "/api/mcp/library/force-sync": {
+      "post": {
+        "operationId": "forceSyncMCPLibrary",
+        "x-access": "g-admin",
+        "summary": "Force MCP library sync",
+        "description": "Triggers an immediate sync of the MCP server library catalog from the\nconfigured source and resets its timer. A request landing on a follower is\nforwarded to the `_meta` leader. In air-gapped mode the sync reads only\n`air_gapped.mcp_library_url`; when it is empty it does nothing and answers\n`status: skipped`.\n",
+        "tags": [
+          "MCP"
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "MCP library synced, or skipped in air-gapped mode without a source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogSyncResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
+          "503": {
+            "description": "Config store not available",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/mcp/per-user-headers/credential/{id}": {
       "delete": {
         "summary": "Revoke a per-user-headers credential",
@@ -20560,8 +20619,9 @@
     "/api/pricing/force-sync": {
       "post": {
         "operationId": "forceSyncPricing",
+        "x-access": "g-admin",
         "summary": "Force pricing sync",
-        "description": "Triggers an immediate pricing sync and resets the pricing sync timer.",
+        "description": "Triggers an immediate pricing and model-parameters sync and resets the sync\ntimer. A request landing on a follower is forwarded to the `_meta` leader,\nwhich syncs, and its answer is relayed. In air-gapped mode the sync reads\nonly `air_gapped.pricing_url` / `air_gapped.model_parameters_url`; with both\nempty it does nothing and answers `status: skipped`.\n",
         "tags": [
           "Configuration"
         ],
@@ -20572,17 +20632,20 @@
         ],
         "responses": {
           "200": {
-            "description": "Pricing sync triggered successfully",
+            "description": "Pricing synced, or skipped in air-gapped mode without a source",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SuccessResponse"
+                  "$ref": "#/components/schemas/CatalogSyncResponse"
                 }
               }
             }
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
           },
           "503": {
             "description": "Config store not available",
@@ -62201,6 +62264,24 @@
           }
         }
       },
+      "AirGappedError": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "air_gapped"
+            ]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error",
+          "message"
+        ]
+      },
       "AllSkillsVersionResponse": {
         "type": "object",
         "properties": {
@@ -65209,6 +65290,26 @@
             "description": "Time to live (e.g., \"1m\", \"1h\")"
           }
         }
+      },
+      "CatalogSyncResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "success",
+              "skipped"
+            ],
+            "description": "`skipped` only in air-gapped mode when the dataset has no air_gapped source."
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "message"
+        ]
       },
       "ChangeAudit": {
         "type": "object",
@@ -75285,6 +75386,22 @@
             "type": "string"
           }
         }
+      },
+      "MetaLeaderUnreachable": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "leader": {
+            "type": "string",
+            "description": "Name of the _meta leader the follower tried to reach."
+          }
+        },
+        "required": [
+          "error",
+          "leader"
+        ]
       },
       "Migration": {
         "type": "object",
@@ -85422,6 +85539,16 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/BifrostError"
+            }
+          }
+        }
+      },
+      "MetaLeaderUnreachable": {
+        "description": "The request landed on a follower and the _meta leader could not be reached to forward it.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/MetaLeaderUnreachable"
             }
           }
         }
