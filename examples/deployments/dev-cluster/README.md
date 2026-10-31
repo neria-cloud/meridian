@@ -49,6 +49,10 @@ does not restart the container, while Traefik's readiness check drains it. Using
 liveness for both would send roughly one request in three to a node that cannot
 serve it.
 
+## Embedded etcd ports
+
+Each node starts native etcd using the existing peer list and its own durable data directory. Client port 2379 and peer port 2380 are internal to the Docker network; no additional host port mapping or `etcd` configuration section is required. Node startup waits for etcd readiness after `_meta` identity admission. Start the founding nodes together so they can form quorum. Their native state lives under `etcd/` alongside the existing `raft/` tree and survives an ordinary container restart.
+
 ## `MERIDIAN_ENCRYPTION_KEY` must be identical on every node
 
 WebSocket tickets (`POST /api/session/ws-ticket` → `GET /ws?ticket=…`) are
