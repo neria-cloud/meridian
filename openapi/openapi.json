@@ -6,7 +6,7 @@
     "description": "Endpoints added by github.com/neria-cloud/meridian-overlay on top of the\nupstream Meridian API. This fragment is merged into the upstream\nspecification; the merged document is the single source consumers use.\n",
     "x-meridian-overlay": {
       "version": "1.6.3",
-      "upstream": "transports/v1.6.12-mrn.5"
+      "upstream": "transports/v1.6.12-mrn.7"
     }
   },
   "tags": [
@@ -11304,6 +11304,278 @@
         }
       }
     },
+    "/api/governance/users/{user_id}/governance": {
+      "parameters": [
+        {
+          "name": "user_id",
+          "in": "path",
+          "required": true,
+          "description": "User ID",
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getUserGovernance",
+        "summary": "Get user governance",
+        "description": "Meridian readback extension: the persisted policy, including the budget IDs the budget-state endpoint accepts. Usage is read through the budget-state API.",
+        "tags": [
+          "Governance"
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The user's governance policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserGovernanceResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Not licensed (`license_violation`, feature `user_governance`) or no global grant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The user does not exist, or has no governance configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateUserGovernance",
+        "summary": "Update user governance",
+        "description": "Partial update: omitted or null fields are unchanged, `budgets: []` and `budget: {}` remove all budgets, a rate_limit with both maxima absent removes it, and `provider_configs: []` removes every grant. An empty body reads without writing.",
+        "tags": [
+          "Governance"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserGovernanceRequest"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The user's governance policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserGovernanceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body, unsupported field, or a budget/rate-limit/grant validation failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Not licensed (`license_violation`, feature `user_governance`) or no global grant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The user does not exist, or has no governance configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createUserGovernance",
+        "summary": "Create user governance",
+        "description": "Configures governance for a user that has none. Omitted provider_configs means no access.",
+        "tags": [
+          "Governance"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserGovernanceRequest"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The user's governance policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserGovernanceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body, unsupported field, or a budget/rate-limit/grant validation failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Not licensed (`license_violation`, feature `user_governance`) or no global grant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The user does not exist, or has no governance configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Governance is already configured for this user.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteUserGovernance",
+        "summary": "Delete user governance",
+        "description": "Removes the user's budgets, rate limit and grants; the user and the VKs it owns stay.",
+        "tags": [
+          "Governance"
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "User governance deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Not licensed (`license_violation`, feature `user_governance`) or no global grant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The user does not exist, or has no governance configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
     "/api/governance/virtual-keys": {
       "get": {
         "operationId": "listVirtualKeys",
@@ -11475,7 +11747,15 @@
             }
           },
           "400": {
-            "$ref": "#/components/responses/BadRequest"
+            "$ref": "#/components/responses/BadRequest",
+            "description": "Invalid request, including an empty user_id or user_id combined with team_id or customer_id."
+          },
+          "403": {
+            "$ref": "#/components/responses/VirtualKeyCreateForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound",
+            "description": "The user specified by user_id does not exist."
           },
           "409": {
             "$ref": "#/components/responses/CustomerMigrating"
@@ -11649,7 +11929,8 @@
             }
           },
           "400": {
-            "$ref": "#/components/responses/BadRequest"
+            "$ref": "#/components/responses/BadRequest",
+            "description": "Invalid request, including team_id or customer_id on a user-owned virtual key, or adding, clearing or changing user_id. An omitted or unchanged user_id is accepted."
           },
           "404": {
             "description": "Virtual key not found",
@@ -68661,6 +68942,13 @@
               }
             }
           },
+          "user_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ID of the user that owns this virtual key directly. Mutually exclusive with team_id and customer_id. On update only the unchanged owner is accepted; adding, clearing or changing it is rejected (400)."
+          },
           "team_id": {
             "type": "string"
           },
@@ -84599,6 +84887,13 @@
               }
             }
           },
+          "user_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ID of the user that owns this virtual key directly. Mutually exclusive with team_id and customer_id. On update only the unchanged owner is accepted; adding, clearing or changing it is rejected (400)."
+          },
           "team_id": {
             "type": "string"
           },
@@ -84734,6 +85029,144 @@
           "updated_at"
         ]
       },
+      "UserBudgetInput": {
+        "type": "object",
+        "required": [
+          "max_limit",
+          "reset_duration"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "An existing budget of this user to keep (its ID survives a duration edit)."
+          },
+          "max_limit": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "reset_duration": {
+            "type": "string",
+            "description": "Positive duration such as 1h, 1d, 1w, 1M; fiscal quarters (Q) are not supported."
+          },
+          "calendar_aligned": {
+            "type": "boolean",
+            "description": "Per-budget alignment; omitted keeps the stored value, or rolling on a new budget."
+          }
+        }
+      },
+      "UserGovernance": {
+        "type": "object",
+        "properties": {
+          "user_id": {
+            "type": "string"
+          },
+          "budgets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Budget"
+            }
+          },
+          "rate_limit_id": {
+            "type": "string"
+          },
+          "rate_limit": {
+            "$ref": "#/components/schemas/RateLimit"
+          },
+          "provider_configs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UserProviderConfig"
+            }
+          }
+        }
+      },
+      "UserGovernanceRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "description": "Must equal the path user_id when present."
+          },
+          "budgets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UserBudgetInput"
+            }
+          },
+          "budget": {
+            "type": "object",
+            "deprecated": true,
+            "additionalProperties": false,
+            "description": "Legacy singular budget; invalid when the user has several budgets.",
+            "properties": {
+              "max_limit": {
+                "type": "number"
+              },
+              "reset_duration": {
+                "type": "string"
+              },
+              "calendar_aligned": {
+                "type": "boolean"
+              }
+            }
+          },
+          "rate_limit": {
+            "$ref": "#/components/schemas/CreateRateLimitRequest"
+          },
+          "provider_configs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UserProviderConfig"
+            }
+          }
+        }
+      },
+      "UserGovernanceResponse": {
+        "type": "object",
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/UserGovernance"
+          }
+        }
+      },
+      "UserProviderConfig": {
+        "type": "object",
+        "required": [
+          "provider"
+        ],
+        "additionalProperties": false,
+        "description": "An explicit grant. An absent provider or an empty allowed_models denies access.",
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "allowed_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "[\"*\"] grants every model of the provider."
+          },
+          "blacklisted_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allow_all_keys": {
+            "type": "boolean"
+          },
+          "key_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Configured key IDs of the provider; [\"*\"] means all keys."
+          }
+        }
+      },
       "UserResponse": {
         "type": "object",
         "properties": {
@@ -84800,6 +85233,13 @@
             "items": {
               "$ref": "#/components/schemas/VirtualKeyMCPConfig"
             }
+          },
+          "user_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ID of the user that owns this virtual key directly. Mutually exclusive with team_id and customer_id."
           },
           "team_id": {
             "type": "string"
@@ -85569,6 +86009,17 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/BifrostError"
+            }
+          }
+        }
+      },
+      "VirtualKeyCreateForbidden": {
+        "description": "The caller lacks `vk.create` at the owner's plane (a create naming `user_id` is authorized at the global plane), or the body names `user_id` on an edition without the `user_governance` license feature (`{\"error\":\"license_violation\",\"feature\":\"user_governance\"}`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": true
             }
           }
         }
