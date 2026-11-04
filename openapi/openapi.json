@@ -5018,8 +5018,11 @@
               }
             }
           },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "421": {
-            "description": "This node does not lead the meta group \u2014 retry against the meta leader",
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -5143,7 +5146,7 @@
             }
           },
           "421": {
-            "description": "This node does not lead the meta group \u2014 retry against the meta leader",
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -5153,7 +5156,21 @@
             }
           },
           "502": {
-            "$ref": "#/components/responses/ClusterForwardFailed"
+            "description": "The ?target= node, or the _meta leader this follower relays to, could not be reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/BifrostError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MetaLeaderUnreachable"
+                    }
+                  ]
+                }
+              }
+            }
           },
           "503": {
             "description": "Topology management is not active on this node (no `_meta` group), or the meta group has no quorum",
@@ -5208,6 +5225,19 @@
           }
         },
         "responses": {
+          "421": {
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "202": {
             "description": "Transfer initiated",
             "content": {
@@ -5854,8 +5884,11 @@
               }
             }
           },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "421": {
-            "description": "This node does not lead the meta group \u2014 retry against the meta leader",
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -6076,8 +6109,11 @@
               }
             }
           },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "421": {
-            "description": "This node does not lead the meta group \u2014 retry against the meta leader",
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -6231,8 +6267,11 @@
               }
             }
           },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "421": {
-            "description": "This node does not lead the meta group \u2014 retry against the meta leader",
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -6395,8 +6434,11 @@
               }
             }
           },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "421": {
-            "description": "This node does not lead the meta group \u2014 retry against the meta leader",
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -6590,8 +6632,11 @@
               }
             }
           },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "421": {
-            "description": "This node does not lead the meta group \u2014 retry against the meta leader",
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -6890,8 +6935,11 @@
               }
             }
           },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "421": {
-            "description": "This node does not lead the meta group \u2014 retry against the meta leader",
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -7185,8 +7233,11 @@
               }
             }
           },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "421": {
-            "description": "This node does not lead the meta group \u2014 retry against the meta leader",
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -7460,6 +7511,9 @@
           }
         ],
         "responses": {
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "501": {
             "description": "Not implemented",
             "content": {
@@ -7656,7 +7710,7 @@
         "operationId": "getTopologyExecution",
         "x-access": "g-read",
         "summary": "Poll an apply run",
-        "description": "Reports the progress of an apply run. Step outcomes are recorded in the\nmeta state machine, so any node can answer and a new meta leader resumes\nwhere the last one stopped.\n",
+        "description": "Reports the progress of an apply run. Step outcomes are recorded in\netcd, so any node can answer and a new meta leader resumes\nwhere the last one stopped.\n",
         "tags": [
           "Cluster"
         ],
@@ -7847,8 +7901,11 @@
               }
             }
           },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "421": {
-            "description": "This node does not lead the meta group \u2014 retry against the meta leader",
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -8094,8 +8151,11 @@
               }
             }
           },
+          "502": {
+            "$ref": "#/components/responses/MetaLeaderUnreachable"
+          },
           "421": {
-            "description": "This node does not lead the meta group \u2014 retry against the meta leader",
+            "description": "No _meta leader is known to this node, or the request was already relayed once. Retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -69199,7 +69259,7 @@
           },
           "total": {
             "type": "integer",
-            "description": "Number of RETAINED versions, bounded by the meta state machine's history\nring (128) \u2014 not the number ever committed.\n"
+            "description": "Number of RETAINED versions, bounded by the retained history\n(128) \u2014 not the number ever committed.\n"
           },
           "items": {
             "type": "array",
@@ -71539,11 +71599,6 @@
             },
             "description": "Placement dimensions for the group."
           },
-          "conf_ver": {
-            "type": "integer",
-            "format": "int64",
-            "description": "RESERVED \u2014 always `0`. Declared so the wire shape is stable, but inert: nothing advances it. Use `version` on the topology document to detect configuration changes."
-          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -71556,7 +71611,7 @@
       },
       "GroupLeaderStatus": {
         "type": "object",
-        "description": "One raft group's runtime view: the quorum shape DECLARED by the document\njoined with the leader OBSERVED from the live raft runtime. Leadership is\nnever read from the Document \u2014 it changes on every election, so it is asked\nof raft at read time and reported unknown when this node cannot answer.\n",
+        "description": "One raft group's runtime view: the quorum shape DECLARED by the document\njoined with the leader OBSERVED from the live raft runtime. Leadership is\nnever read from the Document \u2014 it changes on every election, so it is asked\nof raft at read time and reported unknown when this node cannot answer.\nOn `meta`, `leader_term` is the `_meta` leader's term.\n",
         "properties": {
           "id": {
             "type": "string",
@@ -71586,6 +71641,24 @@
           "observed_health": {
             "$ref": "#/components/schemas/ObservedGroupHealth",
             "description": "The group's observed availability (state/source plus nullable\nobservations). Carries the former `degraded`/`quorum_lost` meaning\nwithout a second contradictory representation. Reported identically for\n`_meta` and data groups.\n"
+          },
+          "leader_term": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "description": "The `_meta` leader's term. Set on the `meta` entry only."
+          },
+          "conf_ver": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "description": "Observed count of applied replica changes in this group. Null when the answering node cannot observe it, for example when it hosts no replica."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "description": "Observed count of association changes: customers for a data shard, the Active topology version for `_meta`. Null when the answering node cannot observe it."
           }
         }
       },
@@ -76383,6 +76456,37 @@
           "health": {
             "$ref": "#/components/schemas/NodeHealth"
           },
+          "heartbeat": {
+            "nullable": true,
+            "description": "Null when the leader has not heard from this node, or when it could not be reached for this read.",
+            "allOf": [
+              {
+                "type": "object",
+                "description": "What the `_meta` leader last heard from a node. It carries no liveness verdict:\n`health` stays gossip-derived.\n",
+                "properties": {
+                  "age_ms": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "binary_version": {
+                    "type": "string"
+                  },
+                  "seen_leader_term": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "seen_meta_conf_ver": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "seen_meta_version": {
+                    "type": "integer",
+                    "format": "int64"
+                  }
+                }
+              }
+            ]
+          },
           "live_addr": {
             "type": "string",
             "description": "The node's raft gRPC address, resolved live through the discovery chain\n(WHERE). Display-only \u2014 never stored in the Document \u2014 and empty when no\nresolver is wired or the name is currently unresolvable.\n"
@@ -78571,7 +78675,7 @@
       },
       "OriginKind": {
         "type": "string",
-        "description": "Which plane produced a Document version \u2014 the audit answer to \"who changed\nthis, and how\". `internal` marks a version nobody asked for that its writer\ndrives to Active itself (a shard `conf_ver` mirror, a failed shard create's\nrollback); it is also the only origin the auto-repair backstop may apply on\nan operator's behalf.\n",
+        "description": "Which plane produced a Document version \u2014 the audit answer to \"who changed\nthis, and how\". `internal` marks a version nobody asked for that its writer\ndrives to Active itself: a failed shard create's rollback.\n",
         "enum": [
           "api",
           "reconciler",
@@ -78743,6 +78847,24 @@
             "description": "Empty when live state already matches the declared document.",
             "items": {
               "$ref": "#/components/schemas/Step"
+            }
+          },
+          "base_epochs": {
+            "type": "object",
+            "description": "Each stepped group's live epoch when the plan was built. A membership step\nfails with `epoch not match` once the group's `conf_ver` has moved beyond\nwhat the plan's own earlier steps explain.\n",
+            "additionalProperties": {
+              "type": "object",
+              "description": "A group's epoch. `conf_ver` counts membership changes, `version` counts what the group holds.",
+              "properties": {
+                "conf_ver": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "version": {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              }
             }
           }
         }
@@ -82380,6 +82502,18 @@
               "local_replica": {
                 "$ref": "#/components/schemas/LocalShardState",
                 "description": "Absent when the answering node hosts no replica of this shard, which\nis the normal case for a node outside the group.\n"
+              },
+              "conf_ver": {
+                "type": "integer",
+                "format": "int64",
+                "nullable": true,
+                "description": "Observed count of applied replica changes in this group. Null when the answering node cannot observe it, for example when it hosts no replica."
+              },
+              "version": {
+                "type": "integer",
+                "format": "int64",
+                "nullable": true,
+                "description": "Observed count of association changes: customers for a data shard, the Active topology version for `_meta`. Null when the answering node cannot observe it."
               }
             }
           }
@@ -82396,6 +82530,18 @@
               "orphaned": {
                 "type": "boolean",
                 "description": "The shard is persisted in `rb_shards` but absent from the topology\ndocument \u2014 left behind by an interrupted create/delete. Absent (not\n`false`) on a declared shard.\n\nAn orphan entry carries its `id` only: `replicas`, `placement` and the\ntimestamps are zero because there is no document to read them from, and\n`GET /shards/{shard_id}` and `/shards/{shard_id}/counters` answer 404\nfor it. It is listable so an operator can see it, not inspectable.\n"
+              },
+              "conf_ver": {
+                "type": "integer",
+                "format": "int64",
+                "nullable": true,
+                "description": "Observed count of applied replica changes in this group. Null when the answering node cannot observe it, for example when it hosts no replica."
+              },
+              "version": {
+                "type": "integer",
+                "format": "int64",
+                "nullable": true,
+                "description": "Observed count of association changes: customers for a data shard, the Active topology version for `_meta`. Null when the answering node cannot observe it."
               }
             }
           }
