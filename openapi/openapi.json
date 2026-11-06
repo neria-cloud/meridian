@@ -11403,7 +11403,7 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "403": {
-            "description": "Not licensed (`license_violation`, feature `user_governance`) or no global grant.",
+            "description": "Not licensed for user governance or no global grant. The error message identifies the reason.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11474,7 +11474,7 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "403": {
-            "description": "Not licensed (`license_violation`, feature `user_governance`) or no global grant.",
+            "description": "Not licensed for user governance or no global grant. The error message identifies the reason.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11545,7 +11545,7 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "403": {
-            "description": "Not licensed (`license_violation`, feature `user_governance`) or no global grant.",
+            "description": "Not licensed for user governance or no global grant. The error message identifies the reason.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11611,7 +11611,7 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "403": {
-            "description": "Not licensed (`license_violation`, feature `user_governance`) or no global grant.",
+            "description": "Not licensed for user governance or no global grant. The error message identifies the reason.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11632,6 +11632,400 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/governance/utilization-profiles": {
+      "get": {
+        "operationId": "listUtilizationProfiles",
+        "summary": "List utilization profiles",
+        "description": "Requires the user-governance edition capability and a global budget.read grant. Includes disabled profiles and projected usage; a fresh installation returns an empty list.",
+        "tags": [
+          "Governance"
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Profiles sorted by slug then internal ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListUtilizationProfilesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Not licensed for user governance or no global grant. The error message identifies the reason.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected management failure. A post-commit readback or reload failure reports that persistence succeeded; inspect the existing profile before retrying creation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Governance or required profile state is unavailable on this node. A mutation can have committed before a cache refresh fails; inspect the error message and read the profile instead of assuming rollback.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createUtilizationProfile",
+        "summary": "Create a utilization profile",
+        "description": "Requires the user-governance edition capability and a global budget.update grant in every budget-management mode. Creates configuration and zero-usage budget windows atomically. Enabled profiles cover providers by union; every matching profile's budgets join the User -> VK reservation on shard0. Matching inference returns 503 until all selected windows have counter_ready_at. Missing coverage returns 403; exhausted budgets return 402. Model and rate-limit settings are unsupported.",
+        "tags": [
+          "Governance"
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUtilizationProfileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Persisted profile configuration, projected usage and counter initialization markers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UtilizationProfileResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or unknown field, explicit null, invalid provider selection, unsupported window, or foreign/duplicate budget ID. Exactly one JSON object is required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Not licensed for user governance or no global grant. The error message identifies the reason.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The slug already exists, including on a disabled profile.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected management failure. A post-commit readback or reload failure reports that persistence succeeded; inspect the existing profile before retrying creation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Governance or required profile state is unavailable on this node. A mutation can have committed before a cache refresh fails; inspect the error message and read the profile instead of assuming rollback.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/governance/utilization-profiles/{profile_id}": {
+      "parameters": [
+        {
+          "name": "profile_id",
+          "in": "path",
+          "required": true,
+          "description": "Immutable internal profile ID, not its slug.",
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getUtilizationProfile",
+        "summary": "Get a utilization profile",
+        "description": "Requires the user-governance edition capability and a global budget.read grant. Read configuration, projected usage and initialization markers. Poll counter_ready_at on the selected budgets for readiness; the local budget-state endpoint can succeed before initialization is committed.",
+        "tags": [
+          "Governance"
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Persisted profile configuration, projected usage and counter initialization markers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UtilizationProfileResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Not licensed for user governance or no global grant. The error message identifies the reason.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No utilization profile with this internal ID exists.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected management failure. A post-commit readback or reload failure reports that persistence succeeded; inspect the existing profile before retrying creation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Governance or required profile state is unavailable on this node. A mutation can have committed before a cache refresh fails; inspect the error message and read the profile instead of assuming rollback.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateUtilizationProfile",
+        "summary": "Update a utilization profile",
+        "description": "Requires the user-governance edition capability and a global budget.update grant in every budget-management mode. Partial update of enabled state, providers, budgets and alignment. Slug and entity_type are immutable. New budget windows start at zero; ordinary limit/provider edits retain existing window usage. Disable retains counters and in-flight settlement. Removing a budget follows existing User/Customer deletion semantics; a later settlement skips an already deleted counter and settles surviving counters.",
+        "tags": [
+          "Governance"
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateUtilizationProfileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Persisted profile configuration, projected usage and counter initialization markers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UtilizationProfileResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or unknown field, explicit null, invalid provider selection, unsupported window, or foreign/duplicate budget ID. Exactly one JSON object is required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Not licensed for user governance or no global grant. The error message identifies the reason.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No utilization profile with this internal ID exists.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected management failure. A post-commit readback or reload failure reports that persistence succeeded; inspect the existing profile before retrying creation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Governance or required profile state is unavailable on this node. A mutation can have committed before a cache refresh fails; inspect the error message and read the profile instead of assuming rollback.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteUtilizationProfile",
+        "summary": "Delete a utilization profile",
+        "description": "Requires the user-governance edition capability and a global budget.update grant in every budget-management mode. Deletes the profile and owned budget rows atomically. Existing User/Customer deletion behavior applies to in-flight settlements; no drain wait is added. With no enabled profiles after cache convergence, requests continue under existing User -> VK rules.",
+        "tags": [
+          "Governance"
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Profile and owned budget rows deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "Utilization profile deleted successfully"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Not licensed for user governance or no global grant. The error message identifies the reason.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No utilization profile with this internal ID exists.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected management failure. A post-commit readback or reload failure reports that persistence succeeded; inspect the existing profile before retrying creation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Governance or required profile state is unavailable on this node. A mutation can have committed before a cache refresh fails; inspect the error message and read the profile instead of assuming rollback.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
           }
         }
       }
@@ -68924,6 +69318,66 @@
           "role"
         ]
       },
+      "CreateUtilizationProfileRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "slug",
+          "entity_type",
+          "enabled",
+          "providers",
+          "budgets"
+        ],
+        "description": "Create a shared user utilization policy. Explicit enabled, providers and budgets are required; false and empty arrays are valid. Null and unknown fields, including models, rate limits, membership and usage, are rejected. No default profile is installed.",
+        "properties": {
+          "slug": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 63,
+            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+            "description": "Unique immutable slug, including among disabled profiles. Deletion releases the slug; recreating it creates a new identity and new budgets."
+          },
+          "entity_type": {
+            "type": "string",
+            "enum": [
+              "user"
+            ],
+            "description": "Immutable entity type. Multiple profiles may target users, including overlapping providers."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Required activation choice; has no implicit default."
+          },
+          "providers": {
+            "$ref": "#/components/schemas/UtilizationProviders"
+          },
+          "budgets": {
+            "type": "array",
+            "description": "All windows apply to the combined consumption of the selected providers across all users. An empty set adds no monetary limit.",
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/UtilizationBudgetInput"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "maxLength": 0
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "calendar_aligned": {
+            "type": "boolean",
+            "default": false,
+            "description": "Apply calendar alignment to all profile windows."
+          }
+        }
+      },
       "CreateVirtualKeyRequest": {
         "type": "object",
         "description": "Create virtual key request",
@@ -73120,6 +73574,21 @@
           "limit": {
             "type": "integer",
             "description": "The effective page size, after clamping."
+          }
+        }
+      },
+      "ListUtilizationProfilesResponse": {
+        "type": "object",
+        "required": [
+          "utilization_profiles"
+        ],
+        "properties": {
+          "utilization_profiles": {
+            "type": "array",
+            "description": "Includes disabled profiles, sorted by slug then internal ID. No pagination in this version.",
+            "items": {
+              "$ref": "#/components/schemas/UtilizationProfile"
+            }
           }
         }
       },
@@ -84954,6 +85423,29 @@
           "role"
         ]
       },
+      "UpdateUtilizationProfileRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Partial PUT. Omitted fields retain their values; supplied arrays replace their collections and empty arrays clear them. Explicit null, slug, entity_type and unknown fields are rejected. An empty object is a no-op. Ordinary limit/provider edits preserve retained budget usage and readiness; window/alignment changes follow the standard reset rules. New windows start at zero and remain unavailable until initialized.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Disabling preserves counters, usage, reset schedules and settlement of existing reservations. Re-enabling resumes current-window usage without backfilling disabled-period consumption."
+          },
+          "providers": {
+            "$ref": "#/components/schemas/UtilizationProviders"
+          },
+          "budgets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UtilizationBudgetInput"
+            }
+          },
+          "calendar_aligned": {
+            "type": "boolean"
+          }
+        }
+      },
       "UpdateVirtualKeyRequest": {
         "type": "object",
         "description": "Update virtual key request",
@@ -85323,6 +85815,172 @@
             "$ref": "#/components/schemas/User"
           }
         }
+      },
+      "UtilizationBudget": {
+        "readOnly": true,
+        "description": "Standard budget projection with profile initialization readiness. current_usage is periodically projected, not a linearizable balance. Use the budget-state endpoint for local Raft usage; its 200 response alone does not establish initialization readiness.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Budget"
+          },
+          {
+            "type": "object",
+            "required": [
+              "counter_ready_at"
+            ],
+            "properties": {
+              "counter_ready_at": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time",
+                "readOnly": true,
+                "description": "Set only after the shard0 leader acknowledges the establishing CONFIG_UPDATE. A matched budget with a null marker causes inference to return 503 before reservation/provider invocation. Poll this field for readiness. It does not promise instantaneous configuration or usage convergence."
+              }
+            }
+          }
+        ]
+      },
+      "UtilizationBudgetInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "max_limit",
+          "reset_duration"
+        ],
+        "description": "Monetary window only. Reset durations must be unique within a profile. An explicit nonempty ID on update must belong to this profile and occur once. Without an ID, an existing unclaimed duration retains its ID; otherwise a new zero-usage window is created. No historical usage is copied.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Existing owned budget ID on update; omit when creating a profile or a new window. An empty string is equivalent to omission."
+          },
+          "max_limit": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Positive finite maximum spend in dollars."
+          },
+          "reset_duration": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Supported positive budget duration, for example 5m, 1h, 1d, 1w, or 1M. Quarterly durations are unsupported. Calendar alignment requires a calendar-compatible duration."
+          }
+        }
+      },
+      "UtilizationProfile": {
+        "type": "object",
+        "required": [
+          "id",
+          "slug",
+          "entity_type",
+          "enabled",
+          "providers",
+          "budgets",
+          "calendar_aligned",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "readOnly": true,
+            "description": "Immutable internal ID used by item routes and budget ownership."
+          },
+          "slug": {
+            "type": "string",
+            "description": "Unique immutable slug."
+          },
+          "entity_type": {
+            "type": "string",
+            "enum": [
+              "user"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "providers": {
+            "$ref": "#/components/schemas/UtilizationProviders"
+          },
+          "budgets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UtilizationBudget"
+            }
+          },
+          "calendar_aligned": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "readOnly": true
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "readOnly": true
+          }
+        }
+      },
+      "UtilizationProfileResponse": {
+        "type": "object",
+        "required": [
+          "utilization_profile"
+        ],
+        "properties": {
+          "utilization_profile": {
+            "$ref": "#/components/schemas/UtilizationProfile"
+          }
+        }
+      },
+      "UtilizationProviders": {
+        "description": "Exact configured provider slugs sharing this profile's common budget set. Empty grants no coverage; [\"*\"] covers all current and future providers. Wildcard must stand alone. Coverage is the union of enabled profiles; all matching profiles are charged. With no enabled profiles, existing User -> VK governance applies.",
+        "oneOf": [
+          {
+            "type": "array",
+            "maxItems": 0,
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1,
+            "items": {
+              "type": "string",
+              "enum": [
+                "*"
+              ]
+            }
+          },
+          {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "not": {
+                "enum": [
+                  "*"
+                ]
+              }
+            }
+          }
+        ],
+        "examples": [
+          [],
+          [
+            "*"
+          ],
+          [
+            "openai",
+            "anthropic"
+          ]
+        ]
       },
       "Version": {
         "type": "string",
