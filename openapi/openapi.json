@@ -2,10 +2,10 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Meridian API",
-    "version": "1.6.3",
+    "version": "1.6.4",
     "description": "Endpoints added by github.com/neria-cloud/meridian-overlay on top of the\nupstream Meridian API. This fragment is merged into the upstream\nspecification; the merged document is the single source consumers use.\n",
     "x-meridian-overlay": {
-      "version": "1.6.3",
+      "version": "1.6.4",
       "upstream": "transports/v1.6.12-mrn.7"
     }
   },
@@ -8360,7 +8360,7 @@
         "operationId": "getEdition",
         "x-access": "public",
         "summary": "Get edition info",
-        "description": "Returns the binary edition (`community` or `enterprise`), the active\nlicense (if loaded), and the current capability flags: `cluster`\n(multi-node topology operations, Pro and Enterprise), `sharding` (more\nthan one shard, shard management and customer migration, Enterprise),\n`guardrails` (Enterprise) and `max_directory_users` (the cap on active\nLDAP-sourced accounts: 20 community, 100 pro, 2000 enterprise).\n`air_gapped` reports air-gapped mode (`air_gapped` in config.json or\n`MERIDIAN_AIR_GAPPED`); the web UI hides the onboarding checklist when it\nis true. Public endpoint \u2014 no authentication required.\n",
+        "description": "Returns the binary edition (`community` or `enterprise`), the active\nlicense (if loaded), and the current capability flags: `cluster`\n(multi-node topology operations, Pro and Enterprise), `sharding` (more\nthan one shard, shard management and customer migration, Enterprise),\n`guardrails` (Enterprise), `user_governance` (user budgets, rate limits,\nprovider access, user-owned virtual keys and utilization profiles,\nEnterprise) and `max_directory_users` (the cap on active\nLDAP-sourced accounts: 20 community, 100 pro, 2000 enterprise).\n`air_gapped` reports air-gapped mode (`air_gapped` in config.json or\n`MERIDIAN_AIR_GAPPED`); the web UI hides the onboarding checklist when it\nis true. Public endpoint \u2014 no authentication required.\n",
         "tags": [
           "Configuration"
         ],
@@ -8415,6 +8415,9 @@
                           "type": "boolean"
                         },
                         "guardrails": {
+                          "type": "boolean"
+                        },
+                        "user_governance": {
                           "type": "boolean"
                         },
                         "max_directory_users": {
@@ -27134,6 +27137,14 @@
               "type": "integer",
               "default": 50,
               "minimum": 1
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "description": "Case-insensitive username substring, matched literally. Narrows within the caller's visibility; `total` counts the matches.",
+            "schema": {
+              "type": "string"
             }
           },
           {
