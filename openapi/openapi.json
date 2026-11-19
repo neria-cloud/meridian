@@ -27222,7 +27222,57 @@
             "description": "Forbidden - insufficient permissions"
           },
           "409": {
-            "description": "User with this username already exists"
+            "description": "A user with this username or this email already exists"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/users/by-email/{email}": {
+      "get": {
+        "operationId": "getUserByEmail",
+        "x-access": "g-read",
+        "summary": "Get user by email",
+        "description": "Returns the single user holding an email address. The address is matched\ncase-insensitively (emails are stored lowercased). Requires the same\npermission as getting a user by ID.\n",
+        "tags": [
+          "Governance"
+        ],
+        "parameters": [
+          {
+            "name": "email",
+            "in": "path",
+            "required": true,
+            "description": "URL-encoded email address",
+            "schema": {
+              "type": "string",
+              "format": "email"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a valid email address"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden - insufficient permissions"
+          },
+          "404": {
+            "description": "User not found"
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
@@ -27544,7 +27594,7 @@
         "operationId": "updateUser",
         "x-access": "g-usermgmt",
         "summary": "Update a user",
-        "description": "Updates user details (display name). Requires Users:Update permission.",
+        "description": "Updates user details (display name, email). Requires Users:Update permission.\nEmail can be changed only for local users; directory (LDAP) users get it\nfrom the directory.\n",
         "tags": [
           "Governance"
         ],
@@ -27579,6 +27629,9 @@
               }
             }
           },
+          "400": {
+            "description": "Not a valid email address, or a display name longer than 255 characters"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -27587,6 +27640,9 @@
           },
           "404": {
             "description": "User not found"
+          },
+          "409": {
+            "description": "Email held by another user, or email is managed by the directory"
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
@@ -69309,6 +69365,11 @@
             "type": "string",
             "description": "Display name (defaults to username if omitted)"
           },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "description": "Optional email, unique across all users; stored lowercased (max 320 characters)"
+          },
           "password": {
             "type": "string",
             "description": "Password (minimum 8 characters)",
@@ -85414,7 +85475,12 @@
         "properties": {
           "display_name": {
             "type": "string",
-            "description": "New display name"
+            "maxLength": 255,
+            "description": "New display name (at most 255 characters)"
+          },
+          "email": {
+            "type": "string",
+            "description": "New email (stored lowercased); an empty string clears it. Omit to leave it unchanged. Only local users may change it: a different value for a directory (LDAP) user answers 409, the current value is accepted as a no-op"
           }
         }
       },
@@ -85636,6 +85702,13 @@
           "display_name": {
             "type": "string",
             "description": "User's display name"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "nullable": true,
+            "description": "Optional, unique across all users and stored lowercased; null when not set. Set by an admin for local users; imported from the directory (`attribute_email`, default `mail`) for LDAP users, where it cannot be edited through the API",
+            "example": "alice@example.com"
           },
           "role": {
             "type": "string",
